@@ -71,7 +71,7 @@ def tabpfn_pred_probas(X_train, y_train, X_test):
         model = TabPFNClassifier(random_state=42)
         model.fit(X_train, target)
         results.append(model.predict_proba(X_test)[:, 1])
-    return np.hstack(results)
+    return np.column_stack(results)
 
 def gen_oof_data(X, y):
     kf = KFold()
@@ -85,12 +85,40 @@ def gen_oof_data(X, y):
         ground_truth.append(y[test_index])
     return np.vstack(tabpfn_pred), np.vstack(ground_truth)
 
-def train(model, X_train, y_train, optimizer, criterion, epochs=10, batch_size=64):
+def train(model, X_train, y_train, optimizer, criterion, save_model=False, config=None,
+          early_stopping_patience=5, early_stopping_delta=1e-4, validation_split=0.2):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    train_ds = TabDataset(X_train, y_train)
+    
+    # 从config中获取参数，如果config为None则使用默认值
+    epochs = config.get('epochs', 10) if config else 10
+    batch_size = config.get('batch_size', 64) if config else 64
+    
+    # 分割训练集和验证集
+    from sklearn.model_selection import train_test_split
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_train, y_train, test_size=validation_split, random_state=42
+    )
+    
+    train_ds = TabDataset(X_tr, y_tr)
+    val_ds = TabDataset(X_val, y_val)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    model.train()
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    
+    # 早停相关变量
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_model_state = None
+    early_stopped = False
+    best_epoch = 0
+    
+    os.makedirs('models', exist_ok=True)
+    
     for epoch in range(epochs):
+        # 训练阶段
+        model.train()
+        train_loss = 0.0
+        train_batches = 0
+        
         for X, y in train_loader:
             X, y = X.to(device), y.to(device)
             optimizer.zero_grad()
@@ -100,17 +128,99 @@ def train(model, X_train, y_train, optimizer, criterion, epochs=10, batch_size=6
 
             loss.backward()
             optimizer.step()
+            
+            train_loss += loss.item()
+            train_batches += 1
 
-        print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}")
-    os.makedirs('models', exist_ok=True)
-    timestamp = datetime.now().strftime("%m%d_%H%M")
-    save_path = os.path.join('models', f'model_epoch{epochs}_{timestamp}.pt')
-    torch.save({
-        'epoch': epochs,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-    }, save_path)
-    print(f"Model saved to {save_path}")
+        avg_train_loss = train_loss / train_batches
+        
+        # 验证阶段
+        model.eval()
+        val_loss = 0.0
+        val_batches = 0
+        
+        with torch.no_grad():
+            for X, y in val_loader:
+                X, y = X.to(device), y.to(device)
+                logits = model(X)
+                loss = criterion(logits, y)
+                val_loss += loss.item()
+                val_batches += 1
+        
+        avg_val_loss = val_loss / val_batches
+        
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        
+        # 早停检查
+        if avg_val_loss < best_val_loss - early_stopping_delta:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            best_epoch = epoch + 1
+            # 保存最佳模型状态
+            best_model_state = {
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict().copy(),
+                'optimizer_state_dict': optimizer.state_dict().copy(),
+                'val_loss': avg_val_loss,
+                'train_loss': avg_train_loss,
+                'config': config
+            }
+            print(f"    New best validation loss: {avg_val_loss:.4f}")
+        else:
+            patience_counter += 1
+            print(f"    No improvement for {patience_counter} epochs")
+            
+            if patience_counter >= early_stopping_patience:
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                early_stopped = True
+                break
+    
+    # 保存模型
+    if save_model:
+        timestamp = datetime.now().strftime("%m%d_%H%M")
+        if early_stopped and best_model_state is not None:
+            # 保存早停时的最佳模型
+            save_path = os.path.join('models', f'model_early_stop_epoch{best_epoch}_{timestamp}.pt')
+            torch.save(best_model_state, save_path)
+            print(f"Early stopped model saved to {save_path} (best epoch: {best_epoch}, val_loss: {best_val_loss:.4f})")
+            
+            # 同时保存config到txt文件
+            config_path = os.path.join('models', f'model_early_stop_epoch{best_epoch}_{timestamp}.txt')
+            with open(config_path, 'w') as f:
+                f.write(f"Model Config:\n")
+                f.write(f"Best Epoch: {best_epoch}\n")
+                f.write(f"Best Val Loss: {best_val_loss:.6f}\n")
+                if config:
+                    for key, value in config.items():
+                        f.write(f"{key}: {value}\n")
+            print(f"Config saved to {config_path}")
+            
+            # 恢复最佳模型状态
+            model.load_state_dict(best_model_state['model_state_dict'])
+            optimizer.load_state_dict(best_model_state['optimizer_state_dict'])
+        else:
+            # 保存最终模型
+            final_epoch = epoch + 1 if not early_stopped else epochs
+            save_path = os.path.join('models', f'model_epoch{final_epoch}_{timestamp}.pt')
+            torch.save({
+                'epoch': final_epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'config': config
+            }, save_path)
+            print(f"Model saved to {save_path}")
+            
+            # 同时保存config到txt文件
+            config_path = os.path.join('models', f'model_epoch{final_epoch}_{timestamp}.txt')
+            with open(config_path, 'w') as f:
+                f.write(f"Model Config:\n")
+                f.write(f"Final Epoch: {final_epoch}\n")
+                if config:
+                    for key, value in config.items():
+                        f.write(f"{key}: {value}\n")
+            print(f"Config saved to {config_path}")
+    
+    return early_stopped, best_epoch if early_stopped else epochs
         
 def load_model(model, optimizer=None, path=None, device=None):
 
@@ -136,8 +246,11 @@ def load_model(model, optimizer=None, path=None, device=None):
                     state[k] = v.to(device)
 
     epoch = checkpoint.get("epoch", None)
+    config = checkpoint.get("config", None)
     print(f"Loaded checkpoint '{path}' (epoch={epoch})")
-    return model, optimizer, epoch
+    if config:
+        print(f"Model config: {config}")
+    return model, optimizer, epoch, config
 
 def predict(model, X_train, y_train, X_test):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -150,7 +263,7 @@ def predict(model, X_train, y_train, X_test):
         probs = torch.sigmoid(logits)
         preds = (probs > 0.5).int()
     
-    return probs.numpy(), preds.numpy()
+    return probs.cpu().numpy(), preds.cpu().numpy()
 
 def evaluate_multilabel(y_true, y_pred, y_prob, print_results=True):
     """
@@ -227,9 +340,16 @@ def evaluate_multilabel(y_true, y_pred, y_prob, print_results=True):
     return results
 
 def main():
+    config = {
+        'd_model': 32,
+        'hidden': 8,
+        'n_heads': 4,
+        'epochs': 30,
+        'batch_size': 128
+    }
     dataset = openml.datasets.get_dataset(41471)
     X, _, _, _ = dataset.get_data(dataset_format='dataframe')
-    X = X.sample(frac=1).reset_index(drop=True).head(1200)
+    X = X.sample(frac=1).reset_index(drop=True).head(3000)
     cols = X.columns[-6:]
     y = X[cols].map(lambda v: 1 if v else 0)
     X = X.drop(columns=cols)
@@ -238,21 +358,41 @@ def main():
     X_scaled = scaler.fit_transform(X)
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y.values, test_size=200, random_state=42
+        X_scaled, y.values, test_size=0.2, random_state=42
     )
     n_labels = y_train.shape[1]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MLPWithAttention(n_labels=n_labels).to(device)
+    model = MLPWithAttention(
+        n_labels=n_labels,
+        d_model=config['d_model'],
+        hidden=config['hidden'],
+        n_heads=config['n_heads']
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=1e-3)
     criterion = nn.BCEWithLogitsLoss()
 
     tabpfn_probs, target = gen_oof_data(X_train, y_train)
-    train(model, tabpfn_probs, target, optimizer, criterion)
+    early_stopped, final_epoch = train(
+        model=model,
+        X_train=tabpfn_probs,
+        y_train=target,
+        optimizer=optimizer,
+        criterion=criterion,
+        save_model=True,
+        config=config
+    )
+    
+    if early_stopped:
+        print(f"\n训练通过早停结束于第{final_epoch}轮")
+    else:
+        print(f"\n训练完成，共{final_epoch}轮")
+    
     y_test_prob, y_test_pred = predict(model, X_train, y_train, X_test)
     
     # 评估模型性能
     evaluate_multilabel(y_test, y_test_pred, y_test_prob)
+    print(config)
     
     
 if __name__ == '__main__':
