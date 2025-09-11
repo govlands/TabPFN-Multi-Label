@@ -18,38 +18,85 @@ import pandas as pd
 from matplotlib.patches import Polygon
 from datetime import datetime
 
-def formalize_output_probas(probas, n_labels):
+def classes_list_from_chain(chain, n_labels):
+    """
+    返回长度为 n_labels 的列表，索引对应原始标签列，
+    每项为该标签对应子分类器的 classes_（或者 None）。
+    """
+    classes_list = [None] * n_labels
+    if not hasattr(chain, "estimators_"):
+        return classes_list
+
+    # chain.order_ 给出 estimators_ 对应的原始标签索引顺序
+    order = getattr(chain, "order_", None)
+    if order is None:
+        # sklearn 旧版本可能没有 order_，假定按 0..n_labels-1
+        order = np.arange(n_labels)
+
+    for est, lbl_idx in zip(chain.estimators_, order):
+        classes_list[int(lbl_idx)] = getattr(est, "classes_", None)
+    return classes_list
+
+def formalize_output_probas(probas, n_labels, classes_list=None, positive_label=1):
     """
     把 predict_proba 的输出统一成 (n_samples, n_labels) 的正类概率矩阵。
-    兼容返回 list/array/3D array 等情况。
+    优先使用 classes_list（每个标签对应的 classes_）来定位正类列。
+    参数:
+      - probas: predict_proba 的返回值（list / ndarray (2D/3D)）
+      - n_labels: 期望标签数
+      - classes_list: 可选 list，每项为该标签对应的 classes_（例如 estimator.classes_）
+      - positive_label: 希望取为正类的标签值（默认 1）
+    返回:
+      - numpy.ndarray, shape (n_samples, n_labels)
     """
-    # list of arrays (one per label)
+
+    def pick_pos_col(arr2d, idx):
+        arr = np.asarray(arr2d)
+        # 一维或单列直接展平
+        if arr.ndim == 1:
+            return arr.ravel()
+        if arr.ndim == 2:
+            # 如果传入了 classes_list，则优先用它定位列
+            if classes_list is not None and idx < len(classes_list) and classes_list[idx] is not None:
+                cls = np.asarray(classes_list[idx], dtype=object)
+                # 匹配数字或字符串形式
+                matches = np.where((cls == positive_label) | (cls.astype(str) == str(positive_label)))[0]
+                if matches.size:
+                    col = matches[0]
+                    return arr[:, col]
+            # 回退：二分类默认取列 1（常见 classes_ == [0,1]）
+            if arr.shape[1] > 1:
+                return arr[:, 1]
+            # 单列情况
+            return arr[:, 0]
+        raise ValueError(f"Unsupported array ndim for single-label proba: {arr.ndim}")
+
+    # 1) list of arrays (one per label)
     if isinstance(probas, list):
         cols = []
-        for p in probas:
+        for i, p in enumerate(probas):
             p = np.asarray(p)
-            if p.ndim == 2 and p.shape[1] > 1:
-                cols.append(p[:, 1])
-            else:
-                cols.append(p.ravel())
+            cols.append(pick_pos_col(p, i))
         return np.column_stack(cols)
 
     probas = np.asarray(probas)
-    # possible shape (n_labels, n_samples, n_classes)
+
+    # 2) possible shape (n_labels, n_samples, n_classes)
     if probas.ndim == 3:
-        # bring to (n_samples, n_labels)
         n_labels0 = probas.shape[0]
         cols = []
         for i in range(n_labels0):
-            if probas.shape[2] > 1:
-                cols.append(probas[i, :, 1])
-            else:
-                cols.append(probas[i, :, 0])
+            arr2d = probas[i]
+            cols.append(pick_pos_col(arr2d, i))
         return np.column_stack(cols)
-    # possible shape (n_samples, n_labels) or (n_samples, n_labels*classes) - assume already (n_samples, n_labels)
-    if probas.ndim == 2 and probas.shape[1] == n_labels:
-        return probas
-    # fallback: raise
+
+    # 3) possible shape (n_samples, n_labels) already
+    if probas.ndim == 2:
+        if probas.shape[1] == n_labels:
+            return probas
+        # 有时返回 (n_samples, n_labels * n_classes) —— 不支持自动拆分
+        raise ValueError("二维 predict_proba 输出的列数与 n_labels 不匹配；请提供 classes_list 或检查基学习器。")
+
     raise ValueError("无法识别 predict_proba 输出格式，请检查 base estimator 是否支持 predict_proba。")
 
 class MLPBaseline(nn.Module):
@@ -107,83 +154,43 @@ def visualize_model_comparison(results_dict, save_prefix=None, figsize=(16, 10))
     # 重命名列以保持一致性
     df_renamed = df.rename(columns=column_mapping)
     
-    # ==================== 图组 1: 雷达图 + 条形图 ====================
-    fig1, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize, 
-                                   subplot_kw={'projection': None})
-    
-    # 1.1 雷达图 - 整体性能对比
-    ax1 = plt.subplot(1, 2, 1, projection='polar')
-    
-    # 根据实际存在的列动态确定指标
-    available_metrics = []
-    desired_metrics = ['micro_f1', 'macro_f1', 'subset_acc', 'auc']
-    for metric in desired_metrics:
-        if metric in df_renamed.columns:
-            available_metrics.append(metric)
-    
-    metrics = available_metrics
-    df_radar = df_renamed[metrics].copy()
-    
-    # 添加转换后的 hamming loss（转为越大越好）
-    if 'hamming' in df_renamed.columns:
-        df_radar['hamming_inv'] = 1 - df_renamed['hamming']
-        metrics.append('hamming_inv')
-    
-    if len(metrics) > 0:
-        angles = np.linspace(0, 2 * np.pi, len(metrics), endpoint=False)
-        angles = np.concatenate((angles, [angles[0]]))
-        
-        colors = plt.cm.Set3(np.linspace(0, 1, len(df_radar)))
-        for i, (model_name, row) in enumerate(df_radar.iterrows()):
-            values = row[metrics].values
-            values = np.concatenate((values, [values[0]]))
-            
-            ax1.plot(angles, values, 'o-', linewidth=2, label=model_name, color=colors[i])
-            ax1.fill(angles, values, alpha=0.15, color=colors[i])
-        
-        ax1.set_xticks(angles[:-1])
-        metric_labels = ['Micro-F1', 'Macro-F1', 'Subset Acc', 'AUC', 'Hamming (inv)'][:len(metrics)]
-        ax1.set_xticklabels(metric_labels)
-        ax1.set_ylim(0, 1)
-        ax1.set_title('模型性能雷达图', size=14, fontweight='bold', pad=20)
-        ax1.legend(loc='upper right', bbox_to_anchor=(1.2, 1.0))
-        ax1.grid(True)
-    
-    # 1.2 条形图 - 各指标详细对比
-    ax2 = plt.subplot(1, 2, 2)
-    metrics_bar = [m for m in ['micro_f1', 'macro_f1', 'subset_acc', 'auc'] if m in df_renamed.columns]
-    
-    if len(metrics_bar) > 0:
-        df_bar = df_renamed[metrics_bar].copy()
-        x = np.arange(len(df_bar))
-        width = 0.15
-        
-        for i, metric in enumerate(metrics_bar):
-            offset = width * i
-            bars = ax2.bar(x + offset, df_bar[metric], width, 
-                          label=metric.replace('_', ' ').title())
-            
-            # 添加数值标签
-            for bar in bars:
-                height = bar.get_height()
-                ax2.text(bar.get_x() + bar.get_width()/2., height + 0.01,
-                        f'{height:.3f}', ha='center', va='bottom', fontsize=8)
-        
-        ax2.set_xlabel('模型')
-        ax2.set_ylabel('分数')
-        ax2.set_title('各指标详细对比', fontweight='bold')
-        ax2.set_xticks(x + width * (len(metrics_bar)-1) / 2)
-        ax2.set_xticklabels(df_bar.index, rotation=45, ha='right')
-        ax2.legend(loc='upper left')
-        ax2.set_ylim(0, 1.1)
-        ax2.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    if save_prefix:
-        save_path1 = f"{save_prefix}_radar_bar.png"
-        plt.savefig(save_path1, dpi=300, bbox_inches='tight')
-        print(f"雷达图和条形图已保存到: {save_path1}")
-    plt.show()
+    # ==================== 图组 1: 各指标详细对比（按指标分组展示各模型表现） ====================
+    # 目标：每个指标为一个组，组内并排显示不同模型的柱状值，便于比较同一指标下的模型表现
+    metrics_bar = [m for m in ['micro_f1', 'macro_f1', 'subset_acc', 'auc', 'hamming'] if m in df_renamed.columns]
+    if len(metrics_bar) == 0:
+        print("No metrics available for bar chart.")
+    else:
+        fig1, ax1 = plt.subplots(1, 1, figsize=figsize)
+        df_bar = df_renamed[metrics_bar].copy()  # shape: (n_models, n_metrics)
+
+        n_models = df_bar.shape[0]
+        n_metrics = df_bar.shape[1]
+        x = np.arange(n_metrics)
+        total_width = 0.8
+        width = total_width / max(n_models, 1)
+
+        colors = plt.cm.tab20(np.linspace(0, 1, n_models))
+        for i, model_name in enumerate(df_bar.index):
+            values = df_bar.loc[model_name].values
+            ax1.bar(x + i * width - total_width/2 + width/2, values, width, label=model_name, color=colors[i])
+            # annotate
+            for xi, v in zip(x + i * width - total_width/2 + width/2, values):
+                ax1.text(xi, v + 0.01, f'{v:.3f}', ha='center', va='bottom', fontsize=8)
+
+        ax1.set_xticks(x)
+        ax1.set_xticklabels([m.replace('_', ' ').title() for m in metrics_bar])
+        ax1.set_ylim(0, 1.05)
+        ax1.set_ylabel('分数')
+        ax1.set_title('各指标详细对比（按指标分组，组内为不同模型）', fontweight='bold')
+        ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        ax1.grid(axis='y', alpha=0.3)
+
+        plt.tight_layout()
+        if save_prefix:
+            save_path1 = f"{save_prefix}_metrics_grouped.png"
+            plt.savefig(save_path1, dpi=300, bbox_inches='tight')
+            print(f"各指标对比柱状图已保存到: {save_path1}")
+        plt.show()
     
     # ==================== 图组 2: 排名热力图 + 综合排名 ====================
     fig2, (ax3, ax4) = plt.subplots(1, 2, figsize=figsize)
@@ -332,7 +339,12 @@ def main():
         br_model.fit(X_train, y_train)
         if hasattr(br_model, "predict_proba"):
             probas = br_model.predict_proba(X_test)
-            probas_mat = formalize_output_probas(probas, n_labels)
+            # 传入每个子分类器的 classes_ 以便准确定位正类列
+            classes_list = []
+            if hasattr(br_model, "estimators_"):
+                for est in br_model.estimators_:
+                    classes_list.append(getattr(est, "classes_", None))
+            probas_mat = formalize_output_probas(probas, n_labels, classes_list=classes_list)
         else:
             probas_mat = br_model.predict(X_test).astype(float)
         BR_results[name] = evaluate_multilabel(y_test, probas_mat, obj_info=f"BR+{name}")
@@ -343,7 +355,11 @@ def main():
         if hasattr(chain, "predict_proba"):
             try:
                 probas_chain = chain.predict_proba(X_test)
-                probas_chain_mat = formalize_output_probas(probas_chain, n_labels)
+                # chain.estimators_ 顺序对应每个标签的子模型，传入 classes_ 有助于精确抽取
+                classes_list = []
+                if hasattr(chain, "estimators_"):
+                    classes_list = classes_list_from_chain(chain, n_labels)
+                probas_chain_mat = formalize_output_probas(probas_chain, n_labels, classes_list=classes_list)
             except Exception:
                 # fallback: 手工按顺序用 estimators_ 逐步构造概率或以硬预测作为近似
                 X_aug = X_test.copy()
