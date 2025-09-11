@@ -13,6 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 import os
 import glob
 from datetime import datetime
+from utils import apply_thresholds
 
 class MLPWithAttention(nn.Module):
     def __init__(self, n_labels, d_model=32, hidden=8, n_heads=4):
@@ -229,7 +230,7 @@ def predict(model, X_train, y_train, X_test):
     
     return probs.cpu().numpy()
 
-def evaluate_multilabel(y_true, y_prob, print_results=True, obj_info=None):
+def evaluate_multilabel(y_true, y_prob, print_results=True, obj_info=None, thresholds=None):
     """
     计算多标签分类的评估指标
     
@@ -245,7 +246,10 @@ def evaluate_multilabel(y_true, y_prob, print_results=True, obj_info=None):
     # 确保输入是 numpy 数组
     y_true = np.array(y_true)
     y_prob = np.array(y_prob)
-    y_pred = (y_prob > 0.5).astype(int)
+    if thresholds is not None:
+        y_pred = apply_thresholds(y_prob, thresholds)
+    else:
+        y_pred = (y_prob > 0.5).astype(int)
     
     # 1. Micro-F1: 全局计算TP, FP, FN
     micro_f1 = f1_score(y_true, y_pred, average='micro')

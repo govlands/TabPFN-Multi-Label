@@ -11,7 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from mlp_att import evaluate_multilabel, train, predict, MLPWithAttention, load_model
+from mlp_att import evaluate_multilabel, train, predict, MLPWithAttention, load_model, get_dataset
+from utils import apply_thresholds, optimize_thresholds
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
@@ -100,7 +101,7 @@ def formalize_output_probas(probas, n_labels, classes_list=None, positive_label=
     raise ValueError("无法识别 predict_proba 输出格式，请检查 base estimator 是否支持 predict_proba。")
 
 class MLPBaseline(nn.Module):
-    def __init__(self, n_features, n_labels, hidden=(64, 32), p_drop=0.2, use_layernorm=True):
+    def __init__(self, n_features, n_labels, hidden=(256, 128), p_drop=0.2, use_layernorm=True):
         super().__init__()
         layers = []
         d_prev = n_features
@@ -302,9 +303,10 @@ def visualize_model_comparison(results_dict, save_prefix=None, figsize=(16, 10))
 
 def main():
     # 生成示例多标签数据
-    X, Y = make_multilabel_classification(n_samples=200, n_features=20, n_classes=6,
-                                          n_labels=2, random_state=0)
-    X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
+    # X, Y = make_multilabel_classification(n_samples=200, n_features=20, n_classes=6,
+    #                                       n_labels=2, random_state=0)
+    # X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
+    X_train, X_test, y_train, y_test = get_dataset()
     n_labels = y_train.shape[1]
     n_features = X_train.shape[1]
     
@@ -312,28 +314,32 @@ def main():
         'Logistic': LogisticRegression(max_iter=1000),
         'RandomForest': RandomForestClassifier(
             n_estimators=200,
+            max_depth=12,
             n_jobs=-1,
             max_features='sqrt',
+            min_samples_split=4,
             min_samples_leaf=2,
             class_weight='balanced_subsample',
             random_state=42
         ),
         'XGBoost': XGBClassifier(
-            n_estimators=200,
+            n_estimators=1000,
             max_depth=6,
             learning_rate=0.1,
             subsample=0.8,
             colsample_bytree=0.8,
             eval_metric='logloss',
             n_jobs=-1,
-            random_state=42
+            random_state=42,
+            tree_method='hist',
+            # device='cuda',
         ),
         'TabPFN': TabPFNClassifier(),
     }
     
     BR_results = {}
     CC_results = {}
-    mlp_results = {}
+    MLP_results = {}
     for name, model in model_dict.items():
         br_model = MultiOutputClassifier(model, n_jobs=-1)
         br_model.fit(X_train, y_train)
@@ -350,6 +356,7 @@ def main():
         BR_results[name] = evaluate_multilabel(y_test, probas_mat, obj_info=f"BR+{name}")
         
     for name, model in model_dict.items():
+        if name == 'TabPFN': continue
         chain = ClassifierChain(model, order='random', random_state=42)
         chain.fit(X_train, y_train)
         if hasattr(chain, "predict_proba"):
@@ -402,15 +409,15 @@ def main():
         X_t= torch.from_numpy(X_test).to(device, dtype=next(model.parameters()).dtype)
         logits = model(X_t)
         probs = torch.sigmoid(logits).cpu().numpy()
-        mlp_results['MLP'] = evaluate_multilabel(y_test, probs, obj_info=f"MLP")
+        MLP_results['MLP'] = evaluate_multilabel(y_test, probs, obj_info=f"MLP")
         
     # TabPFN + Attention 模型（如果存在保存的模型）
     try:
         tabpfn_att = MLPWithAttention(n_labels=n_labels)
-        model_path = ''  # 设置模型路径
+        model_path = 'models/model_early_stop_epoch16_0907_1931.pt'
         load_model(model=tabpfn_att, path=model_path)
         probas = predict(model=tabpfn_att, X_train=X_train, y_train=y_train, X_test=X_test)
-        mlp_results['TabPFN+Attention'] = evaluate_multilabel(y_test, probas, obj_info="TabPFN+Attention")
+        MLP_results['TabPFN+Attention'] = evaluate_multilabel(y_test, probas, obj_info="TabPFN+Attention")
     except Exception as e:
         print(f"无法加载 TabPFN+Attention 模型: {e}")
         print("跳过 TabPFN+Attention 评估")
@@ -421,7 +428,7 @@ def main():
         all_results[f'BR+{name}'] = result
     for name, result in CC_results.items():
         all_results[f'CC+{name}'] = result
-    for name, result in mlp_results.items():
+    for name, result in MLP_results.items():
         all_results[name] = result
     
     # 可视化对比

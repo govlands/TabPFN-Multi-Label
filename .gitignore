@@ -2,5 +2,3 @@ data/*
 __pycache__/*
 models/*
 *.pt
-*.png
-*.jpg
