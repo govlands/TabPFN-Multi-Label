@@ -11,7 +11,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from mlp_att import evaluate_multilabel, train, predict
+from mlp_att import evaluate_multilabel, train, predict, MLPWithAttention, load_model
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from matplotlib.patches import Polygon
+from datetime import datetime
 
 def formalize_output_probas(probas, n_labels):
     """
@@ -66,6 +71,228 @@ class MLPBaseline(nn.Module):
         z = self.backbone(X)
         return self.head(z)
 
+def visualize_model_comparison(results_dict, save_prefix=None, figsize=(16, 10)):
+    """
+    对比多个模型的性能指标，分组显示并保存多个图像文件
+    
+    参数:
+        results_dict: dict，格式 {model_name: {metric_name: value, ...}, ...}
+        save_prefix: str，保存图像的前缀路径（可选）
+        figsize: tuple，每组图像的大小
+    """
+    # 设置中文字体
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
+    plt.rcParams['axes.unicode_minus'] = False
+    
+    # 整理数据
+    df = pd.DataFrame(results_dict).T
+    df = df.fillna(0)  # 填充 NaN 值
+    
+    # 定义指标方向：True表示越大越好，False表示越小越好
+    metric_directions = {
+        'micro_f1': True,
+        'macro_f1': True, 
+        'subset_accuracy': True,
+        'macro_auc': True,
+        'hamming_loss': False  # hamming loss 越小越好
+    }
+    
+    # 统一列名映射，兼容不同的命名约定
+    column_mapping = {
+        'hamming_loss': 'hamming',
+        'subset_accuracy': 'subset_acc', 
+        'macro_auc': 'auc'
+    }
+    
+    # 重命名列以保持一致性
+    df_renamed = df.rename(columns=column_mapping)
+    
+    # ==================== 图组 1: 雷达图 + 条形图 ====================
+    fig1, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize, 
+                                   subplot_kw={'projection': None})
+    
+    # 1.1 雷达图 - 整体性能对比
+    ax1 = plt.subplot(1, 2, 1, projection='polar')
+    
+    # 根据实际存在的列动态确定指标
+    available_metrics = []
+    desired_metrics = ['micro_f1', 'macro_f1', 'subset_acc', 'auc']
+    for metric in desired_metrics:
+        if metric in df_renamed.columns:
+            available_metrics.append(metric)
+    
+    metrics = available_metrics
+    df_radar = df_renamed[metrics].copy()
+    
+    # 添加转换后的 hamming loss（转为越大越好）
+    if 'hamming' in df_renamed.columns:
+        df_radar['hamming_inv'] = 1 - df_renamed['hamming']
+        metrics.append('hamming_inv')
+    
+    if len(metrics) > 0:
+        angles = np.linspace(0, 2 * np.pi, len(metrics), endpoint=False)
+        angles = np.concatenate((angles, [angles[0]]))
+        
+        colors = plt.cm.Set3(np.linspace(0, 1, len(df_radar)))
+        for i, (model_name, row) in enumerate(df_radar.iterrows()):
+            values = row[metrics].values
+            values = np.concatenate((values, [values[0]]))
+            
+            ax1.plot(angles, values, 'o-', linewidth=2, label=model_name, color=colors[i])
+            ax1.fill(angles, values, alpha=0.15, color=colors[i])
+        
+        ax1.set_xticks(angles[:-1])
+        metric_labels = ['Micro-F1', 'Macro-F1', 'Subset Acc', 'AUC', 'Hamming (inv)'][:len(metrics)]
+        ax1.set_xticklabels(metric_labels)
+        ax1.set_ylim(0, 1)
+        ax1.set_title('模型性能雷达图', size=14, fontweight='bold', pad=20)
+        ax1.legend(loc='upper right', bbox_to_anchor=(1.2, 1.0))
+        ax1.grid(True)
+    
+    # 1.2 条形图 - 各指标详细对比
+    ax2 = plt.subplot(1, 2, 2)
+    metrics_bar = [m for m in ['micro_f1', 'macro_f1', 'subset_acc', 'auc'] if m in df_renamed.columns]
+    
+    if len(metrics_bar) > 0:
+        df_bar = df_renamed[metrics_bar].copy()
+        x = np.arange(len(df_bar))
+        width = 0.15
+        
+        for i, metric in enumerate(metrics_bar):
+            offset = width * i
+            bars = ax2.bar(x + offset, df_bar[metric], width, 
+                          label=metric.replace('_', ' ').title())
+            
+            # 添加数值标签
+            for bar in bars:
+                height = bar.get_height()
+                ax2.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                        f'{height:.3f}', ha='center', va='bottom', fontsize=8)
+        
+        ax2.set_xlabel('模型')
+        ax2.set_ylabel('分数')
+        ax2.set_title('各指标详细对比', fontweight='bold')
+        ax2.set_xticks(x + width * (len(metrics_bar)-1) / 2)
+        ax2.set_xticklabels(df_bar.index, rotation=45, ha='right')
+        ax2.legend(loc='upper left')
+        ax2.set_ylim(0, 1.1)
+        ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    if save_prefix:
+        save_path1 = f"{save_prefix}_radar_bar.png"
+        plt.savefig(save_path1, dpi=300, bbox_inches='tight')
+        print(f"雷达图和条形图已保存到: {save_path1}")
+    plt.show()
+    
+    # ==================== 图组 2: 排名热力图 + 综合排名 ====================
+    fig2, (ax3, ax4) = plt.subplots(1, 2, figsize=figsize)
+    
+    # 2.1 排名热力图
+    ranking_data = {}
+    # 越大越好的指标
+    for metric in ['micro_f1', 'macro_f1', 'subset_acc', 'auc']:
+        if metric in df_renamed.columns:
+            ranking_data[metric] = df_renamed[metric].rank(ascending=False, method='min').astype(int)
+    
+    # 越小越好的指标 (hamming loss)
+    if 'hamming' in df_renamed.columns:
+        ranking_data['hamming'] = df_renamed['hamming'].rank(ascending=True, method='min').astype(int)
+    
+    if ranking_data:
+        ranking_df = pd.DataFrame(ranking_data)
+        
+        sns.heatmap(ranking_df, annot=True, fmt='d', cmap='RdYlGn_r', 
+                    ax=ax3, cbar_kws={'label': '排名'})
+        ax3.set_title('各指标模型排名 (1=最佳)', fontweight='bold')
+        ax3.set_xlabel('评估指标')
+        ax3.set_ylabel('模型')
+        
+        # 2.2 综合排名
+        avg_rank = ranking_df.mean(axis=1).sort_values()
+        
+        bars = ax4.barh(range(len(avg_rank)), avg_rank.values)
+        ax4.set_yticks(range(len(avg_rank)))
+        ax4.set_yticklabels(avg_rank.index)
+        ax4.set_xlabel('平均排名')
+        ax4.set_title('综合排名\n(平均排名越小越好)', fontweight='bold')
+        ax4.grid(True, alpha=0.3)
+        
+        # 添加数值标签和颜色
+        best_idx = avg_rank.index[0]
+        worst_idx = avg_rank.index[-1]
+        for i, (model, rank) in enumerate(avg_rank.items()):
+            width = bars[i].get_width()
+            ax4.text(width + 0.05, bars[i].get_y() + bars[i].get_height()/2, 
+                    f'{width:.2f}', ha='left', va='center')
+            
+            if model == best_idx:
+                bars[i].set_color('green')
+                bars[i].set_alpha(0.7)
+            elif model == worst_idx:
+                bars[i].set_color('red')
+                bars[i].set_alpha(0.7)
+    
+    plt.tight_layout()
+    if save_prefix:
+        save_path2 = f"{save_prefix}_ranking.png"
+        plt.savefig(save_path2, dpi=300, bbox_inches='tight')
+        print(f"排名图已保存到: {save_path2}")
+    plt.show()
+    
+    # ==================== 图组 3: 指标分布箱线图 ====================
+    fig3, ax5 = plt.subplots(1, 1, figsize=(figsize[0], figsize[1]//2))
+    
+    # 准备箱线图数据
+    plot_data = []
+    plot_labels = []
+    
+    for metric in ['micro_f1', 'macro_f1', 'subset_acc', 'auc']:
+        if metric in df_renamed.columns:
+            plot_data.append(df_renamed[metric].values)
+            plot_labels.append(metric.replace('_', ' ').title())
+    
+    if plot_data:
+        bp = ax5.boxplot(plot_data, labels=plot_labels, patch_artist=True)
+        
+        # 设置箱线图颜色
+        colors = ['lightblue', 'lightgreen', 'lightcoral', 'lightyellow']
+        for patch, color in zip(bp['boxes'], colors[:len(plot_data)]):
+            patch.set_facecolor(color)
+        
+        ax5.set_title('各指标数值分布', fontweight='bold')
+        ax5.set_ylabel('分数')
+        ax5.grid(True, alpha=0.3)
+        ax5.set_ylim(0, 1)
+    
+    plt.tight_layout()
+    if save_prefix:
+        save_path3 = f"{save_prefix}_distribution.png"  
+        plt.savefig(save_path3, dpi=300, bbox_inches='tight')
+        print(f"分布图已保存到: {save_path3}")
+    plt.show()
+    
+    # 打印总结
+    if 'ranking_df' in locals() and 'avg_rank' in locals():
+        print("\n" + "="*60)
+        print("模型性能总结")
+        print("="*60)
+        print("综合排名 (平均排名越小越好):")
+        for i, (model, rank) in enumerate(avg_rank.items(), 1):
+            print(f"{i:2d}. {model:<20} 平均排名: {rank:.2f}")
+        
+        print(f"\n🏆 最佳模型: {avg_rank.index[0]}")
+        print(f"📊 性能详情:")
+        best_model_metrics = df_renamed.loc[avg_rank.index[0]]
+        for metric, value in best_model_metrics.items():
+            if not np.isnan(value):
+                direction = "↑" if metric_directions.get(metric, True) else "↓"
+                print(f"   {metric}: {value:.4f} {direction}")
+        
+        return df_renamed, ranking_df, avg_rank
+    else:
+        return df_renamed, None, None
+
 def main():
     # 生成示例多标签数据
     X, Y = make_multilabel_classification(n_samples=200, n_features=20, n_classes=6,
@@ -90,7 +317,6 @@ def main():
             learning_rate=0.1,
             subsample=0.8,
             colsample_bytree=0.8,
-            use_label_encoder=False,
             eval_metric='logloss',
             n_jobs=-1,
             random_state=42
@@ -109,7 +335,7 @@ def main():
             probas_mat = formalize_output_probas(probas, n_labels)
         else:
             probas_mat = br_model.predict(X_test).astype(float)
-        BR_results[name] = evaluate_multilabel(y_test, probas_mat)
+        BR_results[name] = evaluate_multilabel(y_test, probas_mat, obj_info=f"BR+{name}")
         
     for name, model in model_dict.items():
         chain = ClassifierChain(model, order='random', random_state=42)
@@ -135,7 +361,7 @@ def main():
         else:
             # 没有 predict_proba，退回到 predict 的 0/1
             probas_chain_mat = chain.predict(X_test).astype(float)
-        CC_results[name] = evaluate_multilabel(y_test, probas_chain_mat)
+        CC_results[name] = evaluate_multilabel(y_test, probas_chain_mat, obj_info=f"CC+{name}")
         
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = MLPBaseline(
@@ -152,15 +378,52 @@ def main():
         optimizer=optimizer,
         criterion=criterion,
         epochs=20,
-        batch_size=128
+        batch_size=64
     )
     
     model.eval()
     with torch.no_grad():
-        X_t= torch.from_numpy(X_test).to(device)
+        X_t= torch.from_numpy(X_test).to(device, dtype=next(model.parameters()).dtype)
         logits = model(X_t)
         probs = torch.sigmoid(logits).cpu().numpy()
-        mlp_results['MLP'] = evaluate_multilabel(y_test, probs)
+        mlp_results['MLP'] = evaluate_multilabel(y_test, probs, obj_info=f"MLP")
+        
+    # TabPFN + Attention 模型（如果存在保存的模型）
+    try:
+        tabpfn_att = MLPWithAttention(n_labels=n_labels)
+        model_path = ''  # 设置模型路径
+        load_model(model=tabpfn_att, path=model_path)
+        probas = predict(model=tabpfn_att, X_train=X_train, y_train=y_train, X_test=X_test)
+        mlp_results['TabPFN+Attention'] = evaluate_multilabel(y_test, probas, obj_info="TabPFN+Attention")
+    except Exception as e:
+        print(f"无法加载 TabPFN+Attention 模型: {e}")
+        print("跳过 TabPFN+Attention 评估")
+    
+    # 整合所有结果
+    all_results = {}
+    for name, result in BR_results.items():
+        all_results[f'BR+{name}'] = result
+    for name, result in CC_results.items():
+        all_results[f'CC+{name}'] = result
+    for name, result in mlp_results.items():
+        all_results[name] = result
+    
+    # 可视化对比
+    print("\n" + "="*80)
+    print("开始可视化模型对比...")
+    print("="*80)
+    
+    timestamp = datetime.now().strftime("%m%d_%H%M")
+    
+    # 确保输出目录存在
+    import os
+    os.makedirs('plots', exist_ok=True)
+    
+    visualize_model_comparison(
+        all_results, 
+        save_prefix=f'plots/model_comparison_{timestamp}',
+        figsize=(16, 10)
+    )
 
 if __name__ == "__main__":
     main()

@@ -193,10 +193,8 @@ def train(model, X_train, y_train, optimizer, criterion, save_model=False, epoch
             }, save_path)
             print(f"Model saved to {save_path}")
     
-def load_model(model, optimizer=None, path=None, device=None):
-
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def load_model(model, optimizer=None, path=None):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if path is None:
         files = glob.glob(os.path.join("models", "*.pt"))
@@ -231,7 +229,7 @@ def predict(model, X_train, y_train, X_test):
     
     return probs.cpu().numpy()
 
-def evaluate_multilabel(y_true, y_prob, print_results=True):
+def evaluate_multilabel(y_true, y_prob, print_results=True, obj_info=None):
     """
     计算多标签分类的评估指标
     
@@ -291,7 +289,10 @@ def evaluate_multilabel(y_true, y_prob, print_results=True):
     
     if print_results:
         print("\n" + "="*50)
-        print("多标签分类评估结果")
+        if obj_info is not None:
+            print(obj_info)
+        else:
+            print("多标签分类评估结果")
         print("="*50)
         print(f"Micro-F1:        {micro_f1:.4f}")
         print(f"Macro-F1:        {macro_f1:.4f}")
