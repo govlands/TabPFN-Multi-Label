@@ -140,7 +140,7 @@ def train_joint(
     batch_size: int = 128,
     early_stopping_patience: int = 5,
     early_stopping_delta: float = 1e-4,
-    validation_split: float = 0.2
+    validation_split: float = 0.15
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -230,8 +230,8 @@ def predict_joint(model, X_train, y_train, X_test):
 def main():
     X, Y = make_multilabel_classification(n_samples=200, n_features=20, n_classes=6,
                                           n_labels=2, random_state=0)
-    X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
-    # X_train, X_test, y_train, y_test = get_dataset(n_total_samples=200)
+    X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.15, random_state=42)
+    # X_train, X_test, y_train, y_test = get_dataset(n_total_samples=200, test_split=0.15)
     n_features, n_labels = X_train.shape[1], y_train.shape[1]
     
     print(f"main: n_features={n_features}, n_labels={n_labels}")
