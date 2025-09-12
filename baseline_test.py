@@ -95,35 +95,79 @@ def visualize_model_comparison(results_dict, save_prefix=None, figsize=(16, 10))
     
     # ==================== 图组 1: 各指标详细对比（按指标分组展示各模型表现） ====================
     # 目标：每个指标为一个组，组内并排显示不同模型的柱状值，便于比较同一指标下的模型表现
-    metrics_bar = [m for m in ['micro_f1', 'macro_f1', 'subset_acc', 'auc', 'hamming'] if m in df_renamed.columns]
-    if len(metrics_bar) == 0:
+    # 将hamming loss分离到单独的图中，其他指标放在主图中
+    
+    # 主要指标（越高越好）
+    main_metrics = [m for m in ['micro_f1', 'macro_f1', 'subset_acc', 'auc'] if m in df_renamed.columns]
+    # hamming loss（越低越好）
+    hamming_metrics = [m for m in ['hamming'] if m in df_renamed.columns]
+    
+    if len(main_metrics) == 0 and len(hamming_metrics) == 0:
         print("No metrics available for bar chart.")
     else:
-        fig1, ax1 = plt.subplots(1, 1, figsize=figsize)
-        df_bar = df_renamed[metrics_bar].copy()  # shape: (n_models, n_metrics)
-
-        n_models = df_bar.shape[0]
-        n_metrics = df_bar.shape[1]
-        x = np.arange(n_metrics)
-        total_width = 0.8
-        width = total_width / max(n_models, 1)
-
+        # 创建子图：第一个用于主要指标，第二个用于hamming loss
+        if len(hamming_metrics) > 0:
+            fig1, (ax1, ax2) = plt.subplots(1, 2, figsize=(figsize[0] * 1.5, figsize[1]))
+        else:
+            fig1, ax1 = plt.subplots(1, 1, figsize=figsize)
+            ax2 = None
+        
+        n_models = df_renamed.shape[0]
         colors = plt.cm.tab20(np.linspace(0, 1, n_models))
-        for i, model_name in enumerate(df_bar.index):
-            values = df_bar.loc[model_name].values
-            ax1.bar(x + i * width - total_width/2 + width/2, values, width, label=model_name, color=colors[i])
-            # annotate
-            for xi, v in zip(x + i * width - total_width/2 + width/2, values):
-                ax1.text(xi, v + 0.01, f'{v:.3f}', ha='center', va='bottom', fontsize=8)
-
-        ax1.set_xticks(x)
-        ax1.set_xticklabels([m.replace('_', ' ').title() for m in metrics_bar])
-        ax1.set_ylim(0, 1.05)
-        ax1.set_ylabel('分数')
-        ax1.set_title('各指标详细对比（按指标分组，组内为不同模型）', fontweight='bold')
-        ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        ax1.grid(axis='y', alpha=0.3)
-
+        
+        # ======== 主要指标图 ========
+        if len(main_metrics) > 0:
+            df_main = df_renamed[main_metrics].copy()
+            n_metrics = df_main.shape[1]
+            x = np.arange(n_metrics)
+            total_width = 0.8
+            width = total_width / max(n_models, 1)
+            
+            for i, model_name in enumerate(df_main.index):
+                values = df_main.loc[model_name].values
+                ax1.bar(x + i * width - total_width/2 + width/2, values, width, label=model_name, color=colors[i])
+                # annotate
+                for xi, v in zip(x + i * width - total_width/2 + width/2, values):
+                    ax1.text(xi, v + 0.005, f'{v:.3f}', ha='center', va='bottom', fontsize=8)
+            
+            ax1.set_xticks(x)
+            ax1.set_xticklabels([m.replace('_', ' ').title() for m in main_metrics])
+            # 调整纵轴范围以增强视觉差异 - 主要指标通常在0.3-0.9之间
+            main_values = df_main.values
+            min_val = max(0, main_values.min() - 0.05)
+            max_val = min(1.0, main_values.max() + 0.05)
+            ax1.set_ylim(min_val, max_val)
+            ax1.set_ylabel('分数（越高越好）')
+            ax1.set_title('主要指标对比', fontweight='bold')
+            ax1.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            ax1.grid(axis='y', alpha=0.3)
+        
+        # ======== Hamming Loss 图 ========
+        if len(hamming_metrics) > 0 and ax2 is not None:
+            df_hamming = df_renamed[hamming_metrics].copy()
+            n_metrics_h = df_hamming.shape[1]
+            x_h = np.arange(n_metrics_h)
+            total_width_h = 0.8
+            width_h = total_width_h / max(n_models, 1)
+            
+            for i, model_name in enumerate(df_hamming.index):
+                values_h = df_hamming.loc[model_name].values
+                ax2.bar(x_h + i * width_h - total_width_h/2 + width_h/2, values_h, width_h, label=model_name, color=colors[i])
+                # annotate
+                for xi, v in zip(x_h + i * width_h - total_width_h/2 + width_h/2, values_h):
+                    ax2.text(xi, v + 0.002, f'{v:.3f}', ha='center', va='bottom', fontsize=8)
+            
+            ax2.set_xticks(x_h)
+            ax2.set_xticklabels([m.replace('_', ' ').title() for m in hamming_metrics])
+            # 调整纵轴范围以增强视觉差异 - hamming loss通常在0.1-0.4之间
+            hamming_values = df_hamming.values
+            min_val_h = max(0, hamming_values.min() - 0.02)
+            max_val_h = hamming_values.max() + 0.02
+            ax2.set_ylim(min_val_h, max_val_h)
+            ax2.set_ylabel('分数（越低越好）')
+            ax2.set_title('Hamming Loss 对比', fontweight='bold')
+            ax2.grid(axis='y', alpha=0.3)
+        
         plt.tight_layout()
         if save_prefix:
             save_path1 = f"{save_prefix}_metrics_grouped.png"
@@ -372,7 +416,7 @@ def main():
     try:
         print(f"\n加载 TabPFN+Attention [features & labels]...")
         joint = JointFeatureLabelAttn(n_features=n_features, n_labels=n_labels)
-        model_path = ''
+        model_path = 'models/joint_model_best_epoch3_0912_2247.pt'
         load_model(model=joint, path=model_path)
         probas = predict_joint(model=joint, X_train=X_train, y_train=y_train, X_test=X_test)
         

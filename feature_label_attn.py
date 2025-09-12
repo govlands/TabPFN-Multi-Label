@@ -34,7 +34,7 @@ class JointFeatureLabelAttn(nn.Module):
     ):
         super().__init__()
         self.n_labels = n_labels
-        self.n_feature_tokens = n_feature_tokens,
+        self.n_feature_tokens = n_feature_tokens
         self.d_model = d_model
         
         self.feature_proj = nn.Sequential(
@@ -138,21 +138,51 @@ def train_joint(
     save_model: bool = False,
     epochs: int = 10,
     batch_size: int = 128,
-    early_stopping_patience: int = 5,
+    early_stopping_patience: int = 10,
     early_stopping_delta: float = 1e-4,
-    validation_split: float = 0.15
+    validation_split: float = 0.15,
+    val_features: np.ndarray = None,
+    val_probas: np.ndarray = None,
+    val_y : np.ndarray = None,
+    enable_early_stopping: bool = True,  # 新增：早停开关
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
     
-    feature_train, feature_val, probas_train, probas_val, y_train, y_val = train_test_split(
-        features, probas, y, test_size=validation_split, random_state=42
-    )
-    print(f"train_joint: train_size={len(feature_train)}, val_size={len(feature_val)}, n_labels={probas.shape[1]}")
+    # 根据早停开关决定是否划分验证集
+    if not enable_early_stopping:
+        # 早停关闭：使用全部训练数据，不划分验证集
+        feature_train, probas_train, y_train = features, probas, y
+        feature_val, probas_val, y_val = None, None, None
+        print(f"train_joint: Early stopping disabled, using full training data")
+    elif val_features is not None and val_probas is not None and val_y is not None:
+        # 早停开启且提供了外部验证集
+        feature_train, probas_train, y_train = features, probas, y
+        feature_val, probas_val, y_val = val_features, val_probas, val_y
+        print(f"train_joint: Using external validation set")
+    else:
+        # 早停开启但未提供外部验证集：内部划分
+        if validation_split is not None and validation_split > 0:
+            feature_train, feature_val, probas_train, probas_val, y_train, y_val = train_test_split(
+                features, probas, y, test_size=validation_split, random_state=42
+            )
+            print(f"train_joint: Using internal validation split ({validation_split})")
+        else:
+            feature_train, probas_train, y_train = features, probas, y
+            feature_val, probas_val, y_val = None, None, None
+            print(f"train_joint: validation_split=0, no validation set created")
+
+    print(f"train_joint: train_size={len(feature_train)}, val_size={len(feature_val) if feature_val is not None else 0}, n_labels={probas.shape[1]}")
 
     train_ds = FeatureLabelDataset(feature_train, probas_train, y_train)
-    val_ds = FeatureLabelDataset(feature_val, probas_val, y_val)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    
+    # 只在有验证集时创建验证加载器
+    if feature_val is not None:
+        val_ds = FeatureLabelDataset(feature_val, probas_val, y_val)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    else:
+        val_loader = None
     
     best_val = float('inf')
     patience = 0
@@ -175,45 +205,67 @@ def train_joint(
             train_batches += 1
         avg_train_loss = train_loss / max(1, train_batches)
         
-        model.eval()
-        val_loss, val_batches = 0.0, 0
-        with torch.no_grad():
-            for feats, probs, yb in val_loader:
-                feats, probs, yb = feats.to(device), probs.to(device), yb.to(device)
-                logits = model(feats, probs)
-                loss = criterion(logits, yb)
-                val_loss += loss.item()
-                val_batches += 1
-        avg_val_loss = val_loss / max(1, val_batches)
-        
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
-        
-        if avg_val_loss < best_val - early_stopping_delta:
-            best_val = avg_val_loss
-            patience = 0
-            best_epoch = epoch + 1
-            best_state = {
-                'epoch': best_epoch,
+        # 只在启用早停且有验证集时计算验证损失
+        if enable_early_stopping and val_loader is not None:
+            model.eval()
+            val_loss, val_batches = 0.0, 0
+            with torch.no_grad():
+                for feats, probs, yb in val_loader:
+                    feats, probs, yb = feats.to(device), probs.to(device), yb.to(device)
+                    logits = model(feats, probs)
+                    loss = criterion(logits, yb)
+                    val_loss += loss.item()
+                    val_batches += 1
+            avg_val_loss = val_loss / max(1, val_batches)
+            
+            print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+            
+            # 早停检查
+            if avg_val_loss < best_val - early_stopping_delta:
+                best_val = avg_val_loss
+                patience = 0
+                best_epoch = epoch + 1
+                best_state = {
+                    'epoch': best_epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_loss': avg_val_loss,
+                    'train_loss': avg_train_loss,
+                }
+                print(f"    New best validation loss: {avg_val_loss:.4f}")
+            else:
+                patience += 1
+                print(f"    No improvement for {patience} epochs")
+                if patience >= early_stopping_patience:
+                    print(f"Early stopping at epoch {epoch+1}")
+                    break
+        else:
+            # 早停关闭或无验证集：只显示训练损失
+            print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}")
+            
+    # 保存模型
+    if save_model:
+        ts = datetime.now().strftime("%m%d_%H%M")
+        if enable_early_stopping and best_state is not None:
+            # 使用早停保存的最佳状态
+            path = os.path.join('models', f'joint_model_best_epoch{best_epoch}_{ts}.pt')
+            torch.save(best_state, path)
+            print(f"Saved best joint model (early stopped) to {path}")
+        else:
+            # 保存最终状态
+            final_state = {
+                'epoch': epochs,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': avg_val_loss,
                 'train_loss': avg_train_loss,
             }
-            print(f"    New best validation loss: {avg_val_loss:.4f}")
-        else:
-            patience += 1
-            print(f"    No improvement for {patience} epochs")
-            if patience >= early_stopping_patience:
-                print(f"Early stopping at epoch {epoch+1}")
-                break
-    if save_model and best_state is not None:
-        ts = datetime.now().strftime("%m%d_%H%M")
-        path = os.path.join('models', f'joint_model_best_epoch{best_epoch}_{ts}.pt')
-        torch.save(best_state, path)
-        print(f"Saved best joint model to {path}")
+            path = os.path.join('models', f'joint_model_final_epoch{epochs}_{ts}.pt')
+            torch.save(final_state, path)
+            print(f"Saved final joint model to {path}")
         
 def predict_joint(model, X_train, y_train, X_test):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
     probas_n = tabpfn_pred_probas(X_train, y_train, X_test)
     probas_t = torch.tensor(probas_n, dtype=torch.float32, device=device)
     features_t = torch.tensor(X_test, dtype=torch.float32, device=device)
@@ -228,17 +280,19 @@ def predict_joint(model, X_train, y_train, X_test):
     return probs.cpu().numpy()
 
 def main():
-    X, Y = make_multilabel_classification(n_samples=200, n_features=20, n_classes=6,
-                                          n_labels=2, random_state=0)
-    X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.15, random_state=42)
-    # X_train, X_test, y_train, y_test = get_dataset(n_total_samples=200, test_split=0.15)
+    # X, Y = make_multilabel_classification(n_samples=200, n_features=20, n_classes=6,
+    #                                       n_labels=2, random_state=0)
+    # X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.15, random_state=42)
+    X_train, X_test, y_train, y_test = get_dataset(test_split=0.15)
     n_features, n_labels = X_train.shape[1], y_train.shape[1]
     
-    print(f"main: n_features={n_features}, n_labels={n_labels}")
+    # device for model / tensors
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"main: n_features={n_features}, n_labels={n_labels}, device={device}")
     model = JointFeatureLabelAttn(
         n_features=n_features,
         n_labels=n_labels,
-    )
+    ).to(device)
     print(f"main: model params count = {sum(p.numel() for p in model.parameters())}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=1e-3)
     criterion = nn.BCEWithLogitsLoss()
@@ -253,9 +307,10 @@ def main():
         y=y_train,
         optimizer=optimizer,
         criterion=criterion,
-        save_model=False,
-        epochs=30,
-        batch_size=128
+        save_model=True,
+        epochs=10,
+        batch_size=128,
+        enable_early_stopping=True,
     )
     print("training over")
     

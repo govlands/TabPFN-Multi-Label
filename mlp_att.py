@@ -205,7 +205,12 @@ def load_model(model, optimizer=None, path=None):
             raise FileNotFoundError("No checkpoint files found in 'models' directory.")
         path = max(files, key=os.path.getmtime)  # latest by modification time
 
-    checkpoint = torch.load(path, map_location=device)
+    # 尝试安全模式加载，如果失败则回退到兼容模式
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=True)
+    except (TypeError, RuntimeError):
+        # weights_only=True 可能不支持或文件包含非张量对象
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
 
@@ -323,9 +328,12 @@ def get_dataset(n_total_samples=3000, test_split=0.2):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y.values, test_size=test_split, random_state=42
-    )
+    if test_split > 0:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_scaled, y.values, test_size=test_split, random_state=42
+        )
+    else:
+        X_train, X_test, y_train, y_test = X_scaled, None, y.values, None
     return X_train, X_test, y_train, y_test
 
 def main():
