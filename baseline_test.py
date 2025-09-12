@@ -6,13 +6,13 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
 from tabpfn import TabPFNClassifier
-from sklearn.metrics import f1_score, hamming_loss, roc_auc_score, accuracy_score
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from mlp_att import evaluate_multilabel, train, predict, MLPWithAttention, load_model, get_dataset
-from utils import apply_thresholds, optimize_thresholds
+from feature_label_attn import JointFeatureLabelAttn, train_joint, predict_joint
+from utils import apply_thresholds, optimize_thresholds, formalize_output_probas
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
@@ -37,68 +37,6 @@ def classes_list_from_chain(chain, n_labels):
     for est, lbl_idx in zip(chain.estimators_, order):
         classes_list[int(lbl_idx)] = getattr(est, "classes_", None)
     return classes_list
-
-def formalize_output_probas(probas, n_labels, classes_list=None, positive_label=1):
-    """
-    把 predict_proba 的输出统一成 (n_samples, n_labels) 的正类概率矩阵。
-    优先使用 classes_list（每个标签对应的 classes_）来定位正类列。
-    参数:
-      - probas: predict_proba 的返回值（list / ndarray (2D/3D)）
-      - n_labels: 期望标签数
-      - classes_list: 可选 list，每项为该标签对应的 classes_（例如 estimator.classes_）
-      - positive_label: 希望取为正类的标签值（默认 1）
-    返回:
-      - numpy.ndarray, shape (n_samples, n_labels)
-    """
-
-    def pick_pos_col(arr2d, idx):
-        arr = np.asarray(arr2d)
-        # 一维或单列直接展平
-        if arr.ndim == 1:
-            return arr.ravel()
-        if arr.ndim == 2:
-            # 如果传入了 classes_list，则优先用它定位列
-            if classes_list is not None and idx < len(classes_list) and classes_list[idx] is not None:
-                cls = np.asarray(classes_list[idx], dtype=object)
-                # 匹配数字或字符串形式
-                matches = np.where((cls == positive_label) | (cls.astype(str) == str(positive_label)))[0]
-                if matches.size:
-                    col = matches[0]
-                    return arr[:, col]
-            # 回退：二分类默认取列 1（常见 classes_ == [0,1]）
-            if arr.shape[1] > 1:
-                return arr[:, 1]
-            # 单列情况
-            return arr[:, 0]
-        raise ValueError(f"Unsupported array ndim for single-label proba: {arr.ndim}")
-
-    # 1) list of arrays (one per label)
-    if isinstance(probas, list):
-        cols = []
-        for i, p in enumerate(probas):
-            p = np.asarray(p)
-            cols.append(pick_pos_col(p, i))
-        return np.column_stack(cols)
-
-    probas = np.asarray(probas)
-
-    # 2) possible shape (n_labels, n_samples, n_classes)
-    if probas.ndim == 3:
-        n_labels0 = probas.shape[0]
-        cols = []
-        for i in range(n_labels0):
-            arr2d = probas[i]
-            cols.append(pick_pos_col(arr2d, i))
-        return np.column_stack(cols)
-
-    # 3) possible shape (n_samples, n_labels) already
-    if probas.ndim == 2:
-        if probas.shape[1] == n_labels:
-            return probas
-        # 有时返回 (n_samples, n_labels * n_classes) —— 不支持自动拆分
-        raise ValueError("二维 predict_proba 输出的列数与 n_labels 不匹配；请提供 classes_list 或检查基学习器。")
-
-    raise ValueError("无法识别 predict_proba 输出格式，请检查 base estimator 是否支持 predict_proba。")
 
 class MLPBaseline(nn.Module):
     def __init__(self, n_features, n_labels, hidden=(256, 128), p_drop=0.2, use_layernorm=True):
@@ -302,11 +240,6 @@ def visualize_model_comparison(results_dict, save_prefix=None, figsize=(16, 10))
         return df_renamed, None, None
 
 def main():
-    # ================= 配置参数 =================
-    enable_threshold_optimization = False  # 是否启用阈值优化
-    threshold_validation_split = 0.5    # 用于阈值优化的验证集比例
-    threshold_method = 'f1'               # 阈值优化目标: 'f1' 或 'balanced_accuracy'
-    
     # 生成示例多标签数据
     # X, Y = make_multilabel_classification(n_samples=200, n_features=20, n_classes=6,
     #                                       n_labels=2, random_state=0)
@@ -314,16 +247,6 @@ def main():
     X_train, X_test, y_train, y_test = get_dataset()
     n_labels = y_train.shape[1]
     n_features = X_train.shape[1]
-    
-    print(f"阈值优化: {'启用' if enable_threshold_optimization else '禁用'}")
-    if enable_threshold_optimization:
-        print(f"优化方法: {threshold_method}, 验证集比例: {threshold_validation_split}")
-        # 为阈值优化分割验证集
-        X_test, X_val_threshold, y_test, y_val_threshold = train_test_split(
-            X_test, y_test, test_size=threshold_validation_split, random_state=42
-        )
-    else:
-        X_val_threshold, y_val_threshold = None, None
     
     model_dict = {
         'Logistic': LogisticRegression(max_iter=1000),
@@ -371,20 +294,7 @@ def main():
         else:
             probas_mat = br_model.predict(X_test).astype(float)
         
-        # 阈值优化
-        optimal_thresholds = None
-        if enable_threshold_optimization and hasattr(br_model, "predict_proba"):
-            # 在验证集上获取预测概率
-            val_probas = br_model.predict_proba(X_val_threshold)
-            val_probas_mat = formalize_output_probas(val_probas, n_labels, classes_list=classes_list)
-            
-            # 优化阈值
-            optimal_thresholds, threshold_scores = optimize_thresholds(
-                y_val_threshold, val_probas_mat, method=threshold_method, verbose=False
-            )
-            print(f"  优化阈值: {optimal_thresholds}")
-        
-        BR_results[name] = evaluate_multilabel(y_test, probas_mat, obj_info=f"BR+{name}", thresholds=optimal_thresholds)
+        BR_results[name] = evaluate_multilabel(y_test, probas_mat, obj_info=f"BR+{name}")
         
     for name, model in model_dict.items():
         if name == 'TabPFN': continue
@@ -418,27 +328,7 @@ def main():
             # 没有 predict_proba，退回到 predict 的 0/1
             probas_chain_mat = chain.predict(X_test).astype(float)
         
-        # 阈值优化
-        optimal_thresholds = None
-        if enable_threshold_optimization and hasattr(chain, "predict_proba"):
-            try:
-                # 在验证集上获取预测概率
-                val_probas_chain = chain.predict_proba(X_val_threshold)
-                val_classes_list = []
-                if hasattr(chain, "estimators_"):
-                    val_classes_list = classes_list_from_chain(chain, n_labels)
-                val_probas_chain_mat = formalize_output_probas(val_probas_chain, n_labels, classes_list=val_classes_list)
-                
-                # 优化阈值
-                optimal_thresholds, threshold_scores = optimize_thresholds(
-                    y_val_threshold, val_probas_chain_mat, method=threshold_method, verbose=False
-                )
-                print(f"  优化阈值: {optimal_thresholds}")
-            except Exception as e:
-                print(f"  阈值优化失败: {e}")
-                optimal_thresholds = None
-        
-        CC_results[name] = evaluate_multilabel(y_test, probas_chain_mat, obj_info=f"CC+{name}", thresholds=optimal_thresholds)
+        CC_results[name] = evaluate_multilabel(y_test, probas_chain_mat, obj_info=f"CC+{name}")
         
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n训练 MLP...")
@@ -461,50 +351,35 @@ def main():
     
     model.eval()
     with torch.no_grad():
-        X_t= torch.from_numpy(X_test).to(device, dtype=next(model.parameters()).dtype)
+        X_t = torch.tensor(X_test, dtype=torch.float32, device=device)
         logits = model(X_t)
         probs = torch.sigmoid(logits).cpu().numpy()
-        
-        # MLP阈值优化
-        optimal_thresholds = None
-        if enable_threshold_optimization:
-            # 在验证集上获取预测概率
-            X_val_t = torch.from_numpy(X_val_threshold).to(device, dtype=next(model.parameters()).dtype)
-            val_logits = model(X_val_t)
-            val_probs = torch.sigmoid(val_logits).cpu().numpy()
-            
-            # 优化阈值
-            optimal_thresholds, threshold_scores = optimize_thresholds(
-                y_val_threshold, val_probs, method=threshold_method, verbose=False
-            )
-            print(f"  优化阈值: {optimal_thresholds}")
-        
-        MLP_results['MLP'] = evaluate_multilabel(y_test, probs, obj_info=f"MLP", thresholds=optimal_thresholds)
+
+        MLP_results['MLP'] = evaluate_multilabel(y_test, probs, obj_info=f"MLP")
         
     # TabPFN + Attention 模型（如果存在保存的模型）
     try:
-        print(f"\n加载 TabPFN+Attention...")
+        print(f"\n加载 TabPFN+Attention [labels only]...")
         tabpfn_att = MLPWithAttention(n_labels=n_labels)
         model_path = 'models/model_early_stop_epoch16_0907_1931.pt'
         load_model(model=tabpfn_att, path=model_path)
         probas = predict(model=tabpfn_att, X_train=X_train, y_train=y_train, X_test=X_test)
         
-        # TabPFN+Attention阈值优化
-        optimal_thresholds = None
-        if enable_threshold_optimization:
-            # 在验证集上获取预测概率
-            val_probas = predict(model=tabpfn_att, X_train=X_train, y_train=y_train, X_test=X_val_threshold)
-            
-            # 优化阈值
-            optimal_thresholds, threshold_scores = optimize_thresholds(
-                y_val_threshold, val_probas, method=threshold_method, verbose=False
-            )
-            print(f"  优化阈值: {optimal_thresholds}")
-        
-        MLP_results['TabPFN+Attention'] = evaluate_multilabel(y_test, probas, obj_info="TabPFN+Attention", thresholds=optimal_thresholds)
+        MLP_results['TabPFN+Attention'] = evaluate_multilabel(y_test, probas, obj_info="TabPFN+Attention [labels only]")
     except Exception as e:
         print(f"无法加载 TabPFN+Attention 模型: {e}")
         print("跳过 TabPFN+Attention 评估")
+    try:
+        print(f"\n加载 TabPFN+Attention [features & labels]...")
+        joint = JointFeatureLabelAttn(n_features=n_features, n_labels=n_labels)
+        model_path = ''
+        load_model(model=joint, path=model_path)
+        probas = predict_joint(model=joint, X_train=X_train, y_train=y_train, X_test=X_test)
+        
+        MLP_results['TabPFN+Attention joint'] = evaluate_multilabel(y_test, probas, obj_info="TabPFN+Attention [features & labels]")
+    except Exception as e:
+        print(f"无法加载 TabPFN+Attention joint模型: {e}")
+        print("跳过 TabPFN+Attention joint评估")
     
     # 整合所有结果
     all_results = {}

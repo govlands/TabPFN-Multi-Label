@@ -13,7 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 import os
 import glob
 from datetime import datetime
-from utils import apply_thresholds
+from utils import apply_thresholds, formalize_output_probas
 
 class MLPWithAttention(nn.Module):
     def __init__(self, n_labels, d_model=32, hidden=8, n_heads=4):
@@ -66,12 +66,14 @@ class TabDataset(Dataset):
 def tabpfn_pred_probas(X_train, y_train, X_test):
     n_labels = y_train.shape[1]
     results = []
+    classes_list = []
     for i in range(n_labels):
         target = y_train[:, i]
         model = TabPFNClassifier(random_state=42)
         model.fit(X_train, target)
-        results.append(model.predict_proba(X_test)[:, 1])
-    return np.column_stack(results)
+        results.append(model.predict_proba(X_test))
+        classes_list.append(model.classes_)
+    return formalize_output_probas(results, n_labels, classes_list)
 
 def gen_oof_data(X, y):
     kf = KFold()
@@ -85,7 +87,7 @@ def gen_oof_data(X, y):
         ground_truth.append(y[test_index])
     return np.vstack(tabpfn_pred), np.vstack(ground_truth)
 
-def train(model, X_train, y_train, optimizer, criterion, save_model=False, epochs=10, batch_size=128,
+def train(model, X_train, y_train, optimizer, criterion, save_model=False, epochs=10, batch_size=128, 
           early_stopping_patience=5, early_stopping_delta=1e-4, validation_split=0.2):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -221,7 +223,7 @@ def load_model(model, optimizer=None, path=None):
 def predict(model, X_train, y_train, X_test):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     probs_pfn_n = tabpfn_pred_probas(X_train, y_train, X_test)
-    probs_pfn_t = torch.from_numpy(probs_pfn_n).to(device=device)
+    probs_pfn_t = torch.tensor(probs_pfn_n, dtype=torch.float32, device=device)
     
     model.eval()
     with torch.no_grad():
@@ -310,7 +312,7 @@ def evaluate_multilabel(y_true, y_prob, print_results=True, obj_info=None, thres
     
     return results
 
-def get_dataset(n_total_samples=3000):
+def get_dataset(n_total_samples=3000, test_split=0.2):
     dataset = openml.datasets.get_dataset(41471)
     X, _, _, _ = dataset.get_data(dataset_format='dataframe')
     X = X.sample(frac=1).reset_index(drop=True).head(n_total_samples)
@@ -322,7 +324,7 @@ def get_dataset(n_total_samples=3000):
     X_scaled = scaler.fit_transform(X)
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y.values, test_size=0.2, random_state=42
+        X_scaled, y.values, test_size=test_split, random_state=42
     )
     return X_train, X_test, y_train, y_test
 
@@ -355,7 +357,7 @@ def main():
         y_train=target,
         optimizer=optimizer,
         criterion=criterion,
-        save_model=True,
+        save_model=False,
         epochs=config['epochs'],
         batch_size=config['batch_size']
     )

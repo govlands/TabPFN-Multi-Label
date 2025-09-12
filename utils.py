@@ -17,6 +17,68 @@ from sklearn.preprocessing import StandardScaler
 import os
 import glob
 
+def formalize_output_probas(probas, n_labels, classes_list=None, positive_label=1):
+    """
+    把 predict_proba 的输出统一成 (n_samples, n_labels) 的正类概率矩阵。
+    优先使用 classes_list（每个标签对应的 classes_）来定位正类列。
+    参数:
+      - probas: predict_proba 的返回值（list / ndarray (2D/3D)）
+      - n_labels: 期望标签数
+      - classes_list: 可选 list，每项为该标签对应的 classes_（例如 estimator.classes_）
+      - positive_label: 希望取为正类的标签值（默认 1）
+    返回:
+      - numpy.ndarray, shape (n_samples, n_labels)
+    """
+
+    def pick_pos_col(arr2d, idx):
+        arr = np.asarray(arr2d)
+        # 一维或单列直接展平
+        if arr.ndim == 1:
+            return arr.ravel()
+        if arr.ndim == 2:
+            # 如果传入了 classes_list，则优先用它定位列
+            if classes_list is not None and idx < len(classes_list) and classes_list[idx] is not None:
+                cls = np.asarray(classes_list[idx], dtype=object)
+                # 匹配数字或字符串形式
+                matches = np.where((cls == positive_label) | (cls.astype(str) == str(positive_label)))[0]
+                if matches.size:
+                    col = matches[0]
+                    return arr[:, col]
+            # 回退：二分类默认取列 1（常见 classes_ == [0,1]）
+            if arr.shape[1] > 1:
+                return arr[:, 1]
+            # 单列情况
+            return arr[:, 0]
+        raise ValueError(f"Unsupported array ndim for single-label proba: {arr.ndim}")
+
+    # 1) list of arrays (one per label)
+    if isinstance(probas, list):
+        cols = []
+        for i, p in enumerate(probas):
+            p = np.asarray(p)
+            cols.append(pick_pos_col(p, i))
+        return np.column_stack(cols)
+
+    probas = np.asarray(probas)
+
+    # 2) possible shape (n_labels, n_samples, n_classes)
+    if probas.ndim == 3:
+        n_labels0 = probas.shape[0]
+        cols = []
+        for i in range(n_labels0):
+            arr2d = probas[i]
+            cols.append(pick_pos_col(arr2d, i))
+        return np.column_stack(cols)
+
+    # 3) possible shape (n_samples, n_labels) already
+    if probas.ndim == 2:
+        if probas.shape[1] == n_labels:
+            return probas
+        # 有时返回 (n_samples, n_labels * n_classes) —— 不支持自动拆分
+        raise ValueError("二维 predict_proba 输出的列数与 n_labels 不匹配；请提供 classes_list 或检查基学习器。")
+
+    raise ValueError("无法识别 predict_proba 输出格式，请检查 base estimator 是否支持 predict_proba。")
+
 def optimize_thresholds(y_true, y_prob, method='f1', search_points=100, verbose=False):
     """
     为每个标签优化阈值以最大化指定指标
