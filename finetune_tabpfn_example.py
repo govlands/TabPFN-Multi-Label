@@ -16,7 +16,7 @@ import numpy as np
 import sklearn.datasets
 import torch
 from sklearn.metrics import log_loss, roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 from torch.optim import AdamW, Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -24,12 +24,27 @@ from tqdm import tqdm
 from tabpfn import TabPFNClassifier
 from tabpfn.finetune_utils import clone_model_for_evaluation
 from tabpfn.utils import meta_dataset_collator
+from sklearn.datasets import make_classification
 
 
 def prepare_data(config: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Loads, subsets, and splits the Covertype dataset."""
     print("--- 1. Data Preparation ---")
-    X_all, y_all = sklearn.datasets.fetch_covtype(return_X_y=True, shuffle=True)
+    # Use a smaller synthetic multi-class dataset instead of Covertype
+
+    n_samples = min(config["num_samples_to_use"], 2000)
+    X_all, y_all = make_classification(
+        n_samples=n_samples,
+        n_features=54,            # keep same dimensionality as Covertype
+        n_informative=20,
+        n_redundant=10,
+        n_repeated=0,
+        n_classes=7,
+        n_clusters_per_class=1,
+        flip_y=0.01,
+        class_sep=1.0,
+        random_state=config["random_seed"],
+    )
 
     rng = np.random.default_rng(config["random_seed"])
     num_samples_to_use = min(config["num_samples_to_use"], len(y_all))
@@ -102,6 +117,10 @@ def evaluate_model(
     return roc_auc, log_loss_score
 
 
+def identity_split(X, y, random_state=None, **kwargs):
+    return X, X, y, y
+
+
 def main() -> None:
     """Main function to configure and run the finetuning workflow."""
     # --- Master Configuration ---
@@ -120,7 +139,7 @@ def main() -> None:
         "valid_set_ratio": 0.3,
         # During evaluation, this is the number of samples from the training set given to the
         # model as context before it makes predictions on the test set.
-        "n_inference_context_samples": 10000,
+        "n_inference_context_samples": 512,
     }
     config["finetuning"] = {
         # The total number of passes through the entire fine-tuning dataset.
@@ -143,7 +162,8 @@ def main() -> None:
     X_train, X_test, y_train, y_test = prepare_data(config)
     classifier, optimizer, classifier_config = setup_model_and_optimizer(config)
 
-    splitter = partial(train_test_split, test_size=config["valid_set_ratio"])
+    # splitter = partial(train_test_split, test_size=1)
+    splitter = identity_split
     training_datasets = classifier.get_preprocessed_datasets(
         X_train, y_train, splitter, config["finetuning"]["batch_size"]
     )
@@ -175,20 +195,56 @@ def main() -> None:
                 cat_ixs,
                 confs,
             ) in progress_bar:
-                if len(np.unique(y_train_batch)) != len(np.unique(y_test_batch)):
-                    continue  # Skip batch if splits don't have all classes
+                X_full = X_train_batch
+                y_full = y_train_batch
+                n_samples = X_full[0].shape[1]
+                
+                if len(y_full) < 2: continue
+                
+                kf = KFold(n_splits=5, shuffle=True, random_state=config['random_seed'])
+                for train_idx, test_idx in kf.split(np.arange(n_samples)):
+                    X_fold_tr = [x[:, train_idx, :] for x in X_full]
+                    X_fold_te = [x[:, test_idx, :] for x in X_full]
+                    y_fold_tr = [y[:, train_idx] for y in y_full]
+                    y_fold_te = y_test_batch[0][test_idx]
+                    
+                    y_fold_tr_n = y_fold_tr[0].squeeze(0).cpu().numpy()
+                    y_fold_te_n = y_fold_te.cpu().numpy()
+                    if len(np.unique(y_fold_te_n)) != len(np.unique(y_fold_tr_n)):
+                        continue
+                    
+                    optimizer.zero_grad()
+                    classifier.fit_from_preprocessed(
+                        X_fold_tr, y_fold_tr, cat_ixs, confs
+                    )
+                    
+                    preds = classifier.forward(X_fold_te, return_logits=True)
+                    # print("preds.shape", preds.shape, "preds.dtype", preds.dtype)
+                    if preds.shape[0] == 1:
+                        preds = preds.squeeze(0)
+                    preds = preds.transpose(0, 1)
+                    target = torch.as_tensor(y_fold_te, dtype=torch.long, device=config['device']) 
+                    # print("target.shape", target.shape, "target.dtype", target.dtype) 
+                     
+                    loss = loss_function(preds, target)
+                    loss.backward()
+                    optimizer.step()
+                    progress_bar.set_postfix(loss=f"{loss.item():.4f}")
+                
+                # if len(np.unique(y_train_batch)) != len(np.unique(y_test_batch)):
+                #     continue  # Skip batch if splits don't have all classes
 
-                optimizer.zero_grad()
-                classifier.fit_from_preprocessed(
-                    X_train_batch, y_train_batch, cat_ixs, confs
-                )
-                predictions = classifier.forward(X_test_batch, return_logits=True)
-                loss = loss_function(predictions, y_test_batch.to(config["device"]))
-                loss.backward()
-                optimizer.step()
+                # optimizer.zero_grad()
+                # classifier.fit_from_preprocessed(
+                #     X_train_batch, y_train_batch, cat_ixs, confs
+                # )
+                # predictions = classifier.forward(X_test_batch, return_logits=True)
+                # loss = loss_function(predictions, y_test_batch.to(config["device"]))
+                # loss.backward()
+                # optimizer.step()
 
-                # Set the postfix of the progress bar to show the current loss
-                progress_bar.set_postfix(loss=f"{loss.item():.4f}")
+                # # Set the postfix of the progress bar to show the current loss
+                # progress_bar.set_postfix(loss=f"{loss.item():.4f}")
 
         # Evaluation Step (runs before finetuning and after each epoch)
         epoch_roc, epoch_log_loss = evaluate_model(
