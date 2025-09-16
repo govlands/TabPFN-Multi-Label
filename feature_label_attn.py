@@ -286,7 +286,6 @@ def main():
     X_train, X_test, y_train, y_test = get_dataset(test_split=0.15)
     n_features, n_labels = X_train.shape[1], y_train.shape[1]
     
-    # device for model / tensors
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"main: n_features={n_features}, n_labels={n_labels}, device={device}")
     model = JointFeatureLabelAttn(
