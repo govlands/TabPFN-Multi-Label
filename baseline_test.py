@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from mlp_att import evaluate_multilabel, train, predict, MLPWithAttention, load_model, get_dataset
 from feature_label_attn import JointFeatureLabelAttn, train_joint, predict_joint
+from joint_training import load_model_e2e, predict_e2e
+
 from utils import apply_thresholds, optimize_thresholds, formalize_output_probas
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -413,6 +415,7 @@ def main():
     except Exception as e:
         print(f"无法加载 TabPFN+Attention 模型: {e}")
         print("跳过 TabPFN+Attention 评估")
+
     try:
         print(f"\n加载 TabPFN+Attention [features & labels]...")
         joint = JointFeatureLabelAttn(n_features=n_features, n_labels=n_labels)
@@ -421,6 +424,17 @@ def main():
         probas = predict_joint(model=joint, X_train=X_train, y_train=y_train, X_test=X_test)
         
         MLP_results['TabPFN+Attention joint'] = evaluate_multilabel(y_test, probas, obj_info="TabPFN+Attention [features & labels]")
+    except Exception as e:
+        print(f"无法加载 TabPFN+Attention joint模型: {e}")
+        print("跳过 TabPFN+Attention joint评估")
+
+    try:
+        print(f"\n加载 TabPFN+Attention [e2e]...")
+        model_path = ''
+        tabpfns, joint, _, _ = load_model_e2e(filepath=model_path)
+        probas = predict_e2e(tabpfns, joint, X_train, y_train, X_test)
+        
+        MLP_results['TabPFN+Attention e2e'] = evaluate_multilabel(y_test, probas, obj_info="TabPFN+Attention [e2e]")
     except Exception as e:
         print(f"无法加载 TabPFN+Attention joint模型: {e}")
         print("跳过 TabPFN+Attention joint评估")

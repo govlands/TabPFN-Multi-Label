@@ -1,4 +1,6 @@
 from functools import partial
+import os
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -13,6 +15,7 @@ from tabpfn.utils import meta_dataset_collator
 from sklearn.datasets import make_multilabel_classification
 from sklearn.metrics import roc_auc_score, log_loss
 from feature_label_attn import JointFeatureLabelAttn
+from mlp_att import evaluate_multilabel, get_dataset
 
 
 class TabDataset(Dataset):
@@ -34,7 +37,7 @@ def prepare_data(config: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.n
         n_labels=2, random_state=config["random_seed"]
     )
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=config["valid_set_ratio"], random_state=config["random_seed"]
+        X, y, test_size=config["test_set_size"], random_state=config["random_seed"]
     )
     print(f"Loaded and split data: {X_train.shape[0]} train, {X_test.shape[0]} test samples.")
     print("---------------------------\n")
@@ -57,7 +60,7 @@ def build_tabpfns(n_labels: int, config: dict) -> list[TabPFNClassifier]:
         clf = TabPFNClassifier(**pfn_cfg)
         clf._initialize_model_variables()
         tabpfns.append(clf)
-    return tabpfns
+    return tabpfns, pfn_cfg
 
 
 def evaluate_model(
@@ -126,14 +129,200 @@ def make_shared_split_fn(train_idx: np.ndarray, test_idx: np.ndarray, prefer_tor
     return split_fn
 
 
+def save_model_e2e(tabpfns, joint_model, optimizer, config, n_features, filepath):
+    """
+    保存端到端联合训练的完整模型状态
+    
+    Args:
+        tabpfns: List of TabPFNClassifier instances
+        joint_model: JointFeatureLabelAttn model
+        optimizer: AdamW optimizer
+        config: Training configuration dict
+        n_features: Number of input features
+        filepath: Path to save the model (without extension)
+    """
+    timestamp = datetime.now().strftime("%m%d_%H%M")
+    if not filepath.endswith(('.pt', '.pth')):
+        filepath = f"{filepath}_{timestamp}.pt"
+    
+    # 收集所有TabPFN模型的状态
+    tabpfn_states = []
+    for i, tabpfn in enumerate(tabpfns):
+        # 保存TabPFN的关键组件
+        tabpfn_state = {
+            'model_state_dict': tabpfn.model_.state_dict(),
+            'config': getattr(tabpfn, 'config_', None),
+            'device': str(tabpfn.device) if hasattr(tabpfn, 'device') else None,
+            'index': i
+        }
+        tabpfn_states.append(tabpfn_state)
+    
+    # 完整的保存状态
+    save_state = {
+        'joint_model_state_dict': joint_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'tabpfn_states': tabpfn_states,
+        'config': config,
+        'n_features': n_features,
+        'n_labels': len(tabpfns),
+        'timestamp': timestamp,
+        'model_type': 'e2e_joint_training'
+    }
+    
+    torch.save(save_state, filepath)
+    print(f"✅ End-to-end model saved to: {filepath}")
+    
+    # 同时保存配置文件
+    config_path = filepath.replace('.pt', '_config.txt')
+    with open(config_path, 'w') as f:
+        f.write("=== End-to-End Joint Training Configuration ===\n")
+        f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"Number of features: {n_features}\n")
+        f.write(f"Number of labels: {len(tabpfns)}\n")
+        f.write(f"Joint model: {joint_model.__class__.__name__}\n")
+        f.write("\nTraining Config:\n")
+        for key, value in config.items():
+            f.write(f"  {key}: {value}\n")
+        f.write(f"\nOptimizer: {optimizer.__class__.__name__}\n")
+        f.write("Model components:\n")
+        f.write(f"  - TabPFN classifiers: {len(tabpfns)}\n")
+        f.write(f"  - Joint attention model: {joint_model.__class__.__name__}\n")
+    
+    return filepath
+
+
+def load_model_e2e(filepath, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    """
+    加载端到端联合训练的完整模型状态
+    
+    Args:
+        filepath: Path to the saved model
+        device: Device to load the model to
+    
+    Returns:
+        tuple: (tabpfns, joint_model, optimizer, config)
+    """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Model file not found: {filepath}")
+    
+    # 加载保存的状态
+    save_state = torch.load(filepath, map_location=device)
+    
+    if save_state.get('model_type') != 'e2e_joint_training':
+        print("⚠️  Warning: This doesn't appear to be an e2e joint training model")
+    
+    config = save_state['config']
+    tabpfn_config = config['tabpfn_config']
+    n_features = save_state['n_features']
+    n_labels = save_state['n_labels']
+    
+    print(f"📦 Loading end-to-end model from: {filepath}")
+    print(f"   Timestamp: {save_state.get('timestamp', 'unknown')}")
+    print(f"   Features: {n_features}, Labels: {n_labels}")
+    
+    tabpfns = [None] * n_labels
+    tabpfn_states = save_state['tabpfn_states']
+    for state in tabpfn_states:
+        idx = state['index']
+        tabpfn = TabPFNClassifier(**tabpfn_config)
+        tabpfn._initialize_model_variables()
+        try:
+            tabpfn.model_.load_state_dict(state['model_state_dict'])
+            print(f"   ✅ Restored TabPFN {idx} model state")
+        except Exception as e:
+            print(f"   ⚠️  Could not restore TabPFN {idx} state: {e}")
+        tabpfns[idx] = tabpfn
+    
+    # 重建联合注意力模型
+    joint_model = JointFeatureLabelAttn(n_features=n_features, n_labels=n_labels).to(device)
+    
+    # 恢复模型状态
+    joint_model.load_state_dict(save_state['joint_model_state_dict'])
+    
+    # 重建优化器
+    # 分离参数组：joint模型参数 vs TabPFN参数
+    joint_params = list(joint_model.parameters())
+    pfn_params = []
+    for tabpfn in tabpfns:
+        pfn_params.extend(list(tabpfn.model_.parameters()))
+    
+    optimizer = AdamW([
+        {'params': joint_params, 'lr': config.get('joint_lr', 1e-4)},
+        {'params': pfn_params, 'lr': config.get('pfn_lr', 1e-5)}
+    ])
+    
+    # 恢复优化器状态
+    try:
+        optimizer.load_state_dict(save_state['optimizer_state_dict'])
+        print("   ✅ Restored optimizer state")
+    except Exception as e:
+        print(f"   ⚠️  Could not restore optimizer state: {e}")
+        print("   🔧 Using fresh optimizer state")
+    
+    print(f"✅ End-to-end model loaded successfully")
+    
+    return tabpfns, joint_model, optimizer, config
+
+
+def predict_e2e(tabpfns, joint_model, X_train, y_train, X_test, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    """
+    端到端预测函数：使用TabPFN分类器和联合注意力模型进行预测
+    
+    Args:
+        tabpfns: List of TabPFNClassifier instances
+        joint_model: JointFeatureLabelAttn model  
+        X_train: Training features (np.ndarray)
+        y_train: Training labels (np.ndarray)
+        X_test: Test features (np.ndarray)
+        device: Device for computation
+    
+    Returns:
+        np.ndarray: Predicted probabilities for test samples (n_test_samples, n_labels)
+    """
+    
+    if not isinstance(X_train, np.ndarray):
+        X_train = np.array(X_train)
+    if not isinstance(y_train, np.ndarray):
+        y_train = np.array(y_train)
+    if not isinstance(X_test, np.ndarray):
+        X_test = np.array(X_test)
+    
+    n_test = X_test.shape[0]
+    n_labels = len(tabpfns)
+    
+    joint_model.eval()
+    z_logits_list = []
+    with torch.no_grad():
+        for label_idx in range(n_labels):
+            y_label = y_train[:, label_idx]
+            eval_cfg = {"device": device, "fit_mode": "fit_preprocessors"}
+            eval_clf = clone_model_for_evaluation(tabpfns[label_idx], eval_cfg, TabPFNClassifier)
+            eval_clf.fit(X_train, y_label)
+            logits = eval_clf.predict_logits(X_test)
+            logits = logits[:, 1]
+            z_logits_list.append(logits)
+    
+    Z_logits = np.stack(z_logits_list, axis=1)
+    
+    X_test_tensor = torch.from_numpy(X_test).to(device=device, dtype=torch.float32)
+    Z_logits_tensor = torch.from_numpy(Z_logits).to(device=device, dtype=torch.float32)
+    
+    with torch.no_grad():
+        joint_logits = joint_model(X_test_tensor, Z_logits_tensor)
+        joint_probs = torch.sigmoid(joint_logits)
+        predictions = joint_probs.cpu().numpy()
+    
+    return predictions
+
+
 def main() -> None:
     """End-to-end joint training: m TabPFNs + JointFeatureLabelAttn with combined loss."""
     # --- Config ---
     config = {
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "random_seed": 42,
-        "n_samples": 2000,
-        "valid_set_ratio": 0.2,
+        "n_samples": 200,
+        "test_set_size": 0.2,
         "batch_size": 512,
         # "holdout_frac": 0.3,  # within-batch split for TabPFN context/test
         "n_splits": 4,
@@ -151,12 +340,14 @@ def main() -> None:
     }
 
     torch.manual_seed(config["random_seed"])
-    X_train, X_test, y_train, y_test = prepare_data(config)
+    # X_train, X_test, y_train, y_test = prepare_data(config)
+    X_train, X_test, y_train, y_test = get_dataset(test_split=0.15)
     n_features, n_labels = X_train.shape[1], y_train.shape[1]
     device = torch.device(config["device"]) if isinstance(config["device"], str) else config["device"]
 
     # Build models
-    tabpfns = build_tabpfns(n_labels, config)
+    tabpfns, pfn_cfg = build_tabpfns(n_labels, config)
+    config['tabpfn_config'] = pfn_cfg
     joint = JointFeatureLabelAttn(n_features=n_features, n_labels=n_labels).to(device)
 
     # Build optimizer with param groups
@@ -175,7 +366,7 @@ def main() -> None:
         batch_size=config["batch_size"], shuffle=True
     )
     
-    DEBUG = True
+    DEBUG = False
 
     print("--- 3. Starting End-to-End Joint Training ---")
     for epoch in range(1, config["epochs"] + 1):
@@ -292,6 +483,16 @@ def main() -> None:
         print(f"Epoch {epoch}: train joint loss = {avg_loss:.4f}")
 
     print("--- ✅ End-to-End Joint Training Finished ---")
+    
+    # 保存完整的端到端模型
+    model_path = os.path.join("models", "e2e_joint_model")
+    os.makedirs("models", exist_ok=True)
+    save_model_e2e(tabpfns, joint, optim, config, n_features, model_path)
+
+    pred_result = predict_e2e(tabpfns, joint, X_train, y_train, X_test)
+    evaluate_multilabel(y_test, pred_result)
+    
+    return tabpfns, joint, optim
 
 
 if __name__ == "__main__":
