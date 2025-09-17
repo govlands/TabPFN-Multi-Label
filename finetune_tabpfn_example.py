@@ -18,7 +18,7 @@ import torch
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.model_selection import train_test_split, KFold
 from torch.optim import AdamW, Optimizer
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from tabpfn import TabPFNClassifier
@@ -139,7 +139,7 @@ def main() -> None:
         "valid_set_ratio": 0.3,
         # During evaluation, this is the number of samples from the training set given to the
         # model as context before it makes predictions on the test set.
-        "n_inference_context_samples": 512,
+        "n_inference_context_samples": 1024,
     }
     config["finetuning"] = {
         # The total number of passes through the entire fine-tuning dataset.
@@ -218,7 +218,7 @@ def main() -> None:
                         X_fold_tr, y_fold_tr, cat_ixs, confs
                     )
                     
-                    preds = classifier.forward(X_fold_te, return_logits=True)
+                    preds = classifier.forward(X_fold_te, return_logits=True)   # (batch, class, n_sample)
                     # print("preds.shape", preds.shape, "preds.dtype", preds.dtype)
                     if preds.shape[0] == 1:
                         preds = preds.squeeze(0)
