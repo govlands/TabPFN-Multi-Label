@@ -318,7 +318,7 @@ def evaluate_multilabel(y_true, y_prob, print_results=True, obj_info=None, thres
     return results
 
 def get_dataset(n_total_samples=3000, test_split=0.2):
-    local_csv = "41471.csv"
+    local_csv = os.path.join("data", "41471.csv")
     if os.path.exists(local_csv):
         X = pd.read_csv(local_csv)
         print(f"Loaded dataset from local file: {local_csv}")

@@ -14,6 +14,8 @@ from tabpfn.finetune_utils import clone_model_for_evaluation
 from tabpfn.utils import meta_dataset_collator
 from sklearn.datasets import make_multilabel_classification
 from sklearn.metrics import roc_auc_score, log_loss
+from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
+
 from feature_label_attn import JointFeatureLabelAttn
 from mlp_att import evaluate_multilabel, get_dataset
 
@@ -315,6 +317,59 @@ def predict_e2e(tabpfns, joint_model, X_train, y_train, X_test, device='cuda' if
     return predictions
 
 
+def predict_e2e_batch(tabpfns, joint_model, X_train, y_train, X_test, batch_size=1024, pred_time=4):
+    """
+    Repeatedly sample small subsets from the training data, run full end-to-end
+    prediction (TabPFNs -> joint model) and average the results.
+
+    This helps stabilize stochastic PFN outputs by Monte-Carlo ensembling over
+    different context subsets drawn from the training set.
+
+    Args:
+        tabpfns: list of TabPFNClassifier
+        joint_model: JointFeatureLabelAttn
+        X_train, y_train: full training data (np.ndarray or convertible)
+        X_test: test features to predict (np.ndarray)
+        batch_size: number of context samples to draw per repetition
+        pred_time: how many independent draws / predictions to average
+
+    Returns:
+        numpy.ndarray of shape (n_test_samples, n_labels) with averaged probs
+    """
+    # Coerce to numpy for sampling convenience
+    if not isinstance(X_train, np.ndarray):
+        X_train = np.array(X_train)
+    if not isinstance(y_train, np.ndarray):
+        y_train = np.array(y_train)
+    if not isinstance(X_test, np.ndarray):
+        X_test = np.array(X_test)
+
+    n_train = X_train.shape[0]
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+
+    # If batch_size larger than available training samples, sample with replacement
+    replace = batch_size > n_train
+
+    preds_accum = None
+    for t in range(pred_time):
+        # sample indices
+        idx = np.random.choice(n_train, size=min(batch_size, n_train), replace=replace)
+        X_sub = X_train[idx]
+        y_sub = y_train[idx]
+        # run full pipeline for this subsample
+        preds = predict_e2e(tabpfns, joint_model, X_sub, y_sub, X_test)
+        if not isinstance(preds, np.ndarray):
+            preds = np.array(preds)
+        if preds_accum is None:
+            preds_accum = preds.astype(np.float64)
+        else:
+            preds_accum += preds.astype(np.float64)
+
+    preds_mean = preds_accum / float(pred_time)
+    return preds_mean
+
+
 def main() -> None:
     """End-to-end joint training: m TabPFNs + JointFeatureLabelAttn with combined loss."""
     # --- Config ---
@@ -323,7 +378,7 @@ def main() -> None:
         "random_seed": 42,
         "n_samples": 200,
         "test_set_size": 0.2,
-        "batch_size": 512,
+        "batch_size": 1024,
         # "holdout_frac": 0.3,  # within-batch split for TabPFN context/test
         "n_splits": 4,
         "epochs": 5,
@@ -336,7 +391,7 @@ def main() -> None:
         "pfn_n_estimators": 4,
         # loss weights
         "lambda1": 0.5,
-        "lambda2": 0.1,
+        "lambda2": 0,
     }
 
     torch.manual_seed(config["random_seed"])
@@ -382,13 +437,21 @@ def main() -> None:
             # shared split indices within batch
             idx = np.arange(n_b)
             
-            kf = KFold(n_splits=config['n_splits'], shuffle=True, random_state=config['random_seed'])
-            for train_idx, test_idx in kf.split(idx):
+            # kf = KFold(n_splits=config['n_splits'], shuffle=True, random_state=config['random_seed'])
+            kf_iter = MultilabelStratifiedKFold(
+                n_splits=config['n_splits'], shuffle=True, random_state=config['random_seed']
+            ).split(idx, Y_mb)
+            
+            batch_loss_sum = None
+            n_used_folds = 0
+            
+            for train_idx, test_idx in kf_iter:
                 if DEBUG: print(f"n_train: {len(train_idx)}, n_test: {len(test_idx)}")
                 skip_fold = False
                 for i in range(n_labels):
                     if len(np.unique(Y_mb[test_idx, i])) < 2 or len(np.unique(Y_mb[train_idx, i])) < 2:
                         skip_fold = True
+                        break
                 if skip_fold: continue
 
                 split_fn = make_shared_split_fn(train_idx, test_idx, prefer_torch=True)
@@ -399,7 +462,6 @@ def main() -> None:
 
                 # For each label, get preprocessed data and run PFN fit+forward
                 for ell in range(n_labels):
-                    y_ell = Y_mb[:, ell]
                     y_ell_t = Y_mb_t[:, ell]
                     ds = tabpfns[ell].get_preprocessed_datasets(
                         X_mb_t, y_ell_t, split_fn, max_data_size=None
@@ -473,8 +535,13 @@ def main() -> None:
                     loss_kl = torch.tensor(0.0, device=device)
                 loss = loss2 + config["lambda1"] * loss_z + config["lambda2"] * loss_kl
 
+                batch_loss_sum = loss if batch_loss_sum is None else (batch_loss_sum + loss)
+                n_used_folds += 1
+
+            if n_used_folds > 0:
+                loss_mean = batch_loss_sum / n_used_folds
                 optim.zero_grad()
-                loss.backward()
+                loss_mean.backward()
                 optim.step()
                 running += float(loss.item())
                 steps += 1
@@ -489,8 +556,12 @@ def main() -> None:
     os.makedirs("models", exist_ok=True)
     save_model_e2e(tabpfns, joint, optim, config, n_features, model_path)
 
-    pred_result = predict_e2e(tabpfns, joint, X_train, y_train, X_test)
-    evaluate_multilabel(y_test, pred_result)
+    pred_result_all = predict_e2e(tabpfns, joint, X_train, y_train, X_test)
+    pred_result_batch = predict_e2e_batch(tabpfns, joint, X_train, y_train, X_test, batch_size=config["batch_size"])
+    print("pred_result_all performence:")
+    evaluate_multilabel(y_test, pred_result_all)
+    print("pred_result_batch perfrmence:")
+    evaluate_multilabel(y_test, pred_result_batch)
     
     return tabpfns, joint, optim
 
