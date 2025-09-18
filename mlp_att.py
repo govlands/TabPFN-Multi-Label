@@ -318,9 +318,20 @@ def evaluate_multilabel(y_true, y_prob, print_results=True, obj_info=None, thres
     return results
 
 def get_dataset(n_total_samples=3000, test_split=0.2):
-    dataset = openml.datasets.get_dataset(41471)
-    X, _, _, _ = dataset.get_data(dataset_format='dataframe')
-    X = X.sample(frac=1).reset_index(drop=True).head(n_total_samples)
+    local_csv = "41471.csv"
+    if os.path.exists(local_csv):
+        X = pd.read_csv(local_csv)
+        print(f"Loaded dataset from local file: {local_csv}")
+    else:
+        dataset = openml.datasets.get_dataset(41471)
+        X, _, _, _ = dataset.get_data(dataset_format='dataframe')
+        try:
+            X.to_csv(local_csv, index=False)
+            print(f"Fetched dataset from OpenML and saved to {local_csv}")
+        except Exception:
+            print("Fetched dataset from OpenML (failed to save locally)")
+    X = X.sample(frac=1, random_state=42).reset_index(drop=True).head(n_total_samples)
+
     cols = X.columns[-6:]
     y = X[cols].map(lambda v: 1 if v else 0)
     X = X.drop(columns=cols)
