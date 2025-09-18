@@ -430,7 +430,7 @@ def main():
 
     try:
         print(f"\n加载 TabPFN+Attention [e2e]...")
-        model_path = ''
+        model_path = 'models/'
         tabpfns, joint, _, _ = load_model_e2e(filepath=model_path)
         probas = predict_e2e(tabpfns, joint, X_train, y_train, X_test)
         
