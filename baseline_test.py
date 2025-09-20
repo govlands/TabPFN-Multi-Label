@@ -8,17 +8,14 @@ from xgboost import XGBClassifier
 from tabpfn import TabPFNClassifier
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from mlp_att import evaluate_multilabel, train, predict, MLPWithAttention, load_model, get_dataset
-from feature_label_attn import JointFeatureLabelAttn, train_joint, predict_joint
-from joint_training import load_model_e2e, predict_e2e
+from mlp_att import evaluate_multilabel, get_dataset, MultiLabelTabPFN_LabelOnly, train, MLPWithAttention, predict, load_model
+from feature_label_attn import MultiLabelTabPFN_FeatureLabel, predict_joint, JointFeatureLabelAttn
+from joint_training import MultiLabelTabPFN_e2eFeatureLabel
 
-from utils import apply_thresholds, optimize_thresholds, formalize_output_probas
+from utils import formalize_output_probas
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
-from matplotlib.patches import Polygon
 from datetime import datetime
 
 def classes_list_from_chain(chain, n_labels):
@@ -299,7 +296,7 @@ def main():
         'RandomForest': RandomForestClassifier(
             n_estimators=200,
             max_depth=12,
-            n_jobs=-1,
+            n_jobs=16,
             max_features='sqrt',
             min_samples_split=4,
             min_samples_leaf=2,
@@ -313,7 +310,7 @@ def main():
             subsample=0.8,
             colsample_bytree=0.8,
             eval_metric='logloss',
-            n_jobs=-1,
+            n_jobs=16,
             random_state=42,
             tree_method='hist',
             # device='cuda',
@@ -403,41 +400,76 @@ def main():
 
         MLP_results['MLP'] = evaluate_multilabel(y_test, probs, obj_info=f"MLP")
         
-    # TabPFN + Attention 模型（如果存在保存的模型）
+    # TabPFN + Attention 模型（标签注意力）
     try:
-        print(f"\n加载 TabPFN+Attention [labels only]...")
-        tabpfn_att = MLPWithAttention(n_labels=n_labels)
-        model_path = 'models/model_early_stop_epoch16_0907_1931.pt'
-        load_model(model=tabpfn_att, path=model_path)
-        probas = predict(model=tabpfn_att, X_train=X_train, y_train=y_train, X_test=X_test)
+        print(f"\n训练 TabPFN+Attention [labels only]...")
+        # 使用封装的类
+        model_label_only = MultiLabelTabPFN_LabelOnly(
+            n_labels=n_labels,
+            epochs=20,
+            batch_size=128,
+            early_stopping_patience=5,
+            validation_split=0.2,
+        )
+        model_label_only.fit(X_train, y_train, save_model=True)
+        probas = model_label_only.predict_proba(X_test)
         
         MLP_results['TabPFN+Attention'] = evaluate_multilabel(y_test, probas, obj_info="TabPFN+Attention [labels only]")
+        print("✅ TabPFN+Attention [labels only] 模型已训练并保存")
     except Exception as e:
-        print(f"无法加载 TabPFN+Attention 模型: {e}")
-        print("跳过 TabPFN+Attention 评估")
+        print(f"❌ TabPFN+Attention [labels only] 训练失败: {e}")
+        import traceback
+        traceback.print_exc()
 
     try:
-        print(f"\n加载 TabPFN+Attention [features & labels]...")
-        joint = JointFeatureLabelAttn(n_features=n_features, n_labels=n_labels)
-        model_path = 'models/joint_model_best_epoch3_0912_2247.pt'
-        load_model(model=joint, path=model_path)
-        probas = predict_joint(model=joint, X_train=X_train, y_train=y_train, X_test=X_test)
+        print(f"\n训练 TabPFN+Attention [features & labels]...")
+        # 使用封装的类
+        model_feature_label = MultiLabelTabPFN_FeatureLabel(
+            n_features=n_features,
+            n_labels=n_labels,
+            epochs=20,
+            batch_size=128,
+            early_stopping_patience=5,
+            validation_split=0.15,
+        )
+        model_feature_label.fit(X_train, y_train, save_model=True)
+        probas = model_feature_label.predict_proba(X_test)
         
         MLP_results['TabPFN+Attention joint'] = evaluate_multilabel(y_test, probas, obj_info="TabPFN+Attention [features & labels]")
+        print("✅ TabPFN+Attention [features & labels] 模型已训练并保存")
     except Exception as e:
-        print(f"无法加载 TabPFN+Attention joint模型: {e}")
-        print("跳过 TabPFN+Attention joint评估")
+        print(f"❌ TabPFN+Attention [features & labels] 训练失败: {e}")
+        import traceback
+        traceback.print_exc()
 
     try:
-        print(f"\n加载 TabPFN+Attention [e2e]...")
-        model_path = 'models/'
-        tabpfns, joint, _, _ = load_model_e2e(filepath=model_path)
-        probas = predict_e2e(tabpfns, joint, X_train, y_train, X_test)
+        print(f"\n训练 TabPFN+Attention [e2e]...")
+        # 使用封装的类 - 端到端训练
+        model_e2e = MultiLabelTabPFN_e2eFeatureLabel(
+            n_features=n_features,
+            n_labels=n_labels,
+            epochs=10,  # 较少的epochs防止显存不足
+            batch_size=400,
+            n_splits=4,  # 较少的splits减少内存占用
+            pfn_n_estimators=4,  # 减少估计器数量
+            validation_split=0.15,
+            early_stopping_patience=5,
+            early_stopping_delta=1e-4,
+        )
+        model_e2e.fit(X_train, y_train)
+        probas = model_e2e.predict_proba(X_test, mode='all')
+        
+        # 保存模型
+        save_path = model_e2e.save()
+        print(f"✅ 端到端模型已保存到: {save_path}")
         
         MLP_results['TabPFN+Attention e2e'] = evaluate_multilabel(y_test, probas, obj_info="TabPFN+Attention [e2e]")
+        print("✅ TabPFN+Attention [e2e] 模型已训练并保存")
     except Exception as e:
-        print(f"无法加载 TabPFN+Attention joint模型: {e}")
-        print("跳过 TabPFN+Attention joint评估")
+        print(f"❌ TabPFN+Attention [e2e] 训练失败: {e}")
+        print("这可能是由于显存不足导致的，请考虑减少batch_size或使用CPU训练")
+        import traceback
+        traceback.print_exc()
     
     # 整合所有结果
     all_results = {}

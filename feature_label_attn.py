@@ -8,7 +8,7 @@ import os
 from datetime import datetime
 from sklearn.datasets import make_multilabel_classification
 
-from mlp_att import tabpfn_pred_probas, get_dataset, evaluate_multilabel
+from mlp_att import tabpfn_pred_probas, get_dataset, evaluate_multilabel, load_model
 
 class JointFeatureLabelAttn(nn.Module):
     """
@@ -279,41 +279,105 @@ def predict_joint(model, X_train, y_train, X_test):
     print(f"predict_joint: produced probs shape={probs.shape}")
     return probs.cpu().numpy()
 
+class MultiLabelTabPFN_FeatureLabel:
+    def __init__(
+        self,
+        n_features: int,
+        n_labels: int, 
+        d_model: int = 64,
+        n_heads: int = 4,
+        n_feature_tokens: int = 6,
+        h_feature: int = 128,
+        h_label: int = 32,
+        dropout: float = 0.1,
+        epochs: int = 10,
+        batch_size: int = 128,
+        early_stopping_patience: int = 10,
+        early_stopping_delta: float = 1e-4,
+        validation_split: float = 0.15,
+        learning_rate: float = 3e-3,
+        weight_decay : float = 1e-3
+    ):
+        self.n_features = n_features
+        self.n_labels = n_labels
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_feature_tokens = n_feature_tokens
+        self.h_feature = h_feature
+        self.h_label = h_label
+        self.dropout = dropout
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_delta = early_stopping_delta
+        self.validation_split = validation_split
+        self.lr = learning_rate
+        self.weight_decay = weight_decay
+        
+        self.level2model = JointFeatureLabelAttn(
+            n_features=self.n_features,
+            n_labels=self.n_labels,
+            d_model=self.d_model,
+            n_heads=self.n_heads,
+            n_feature_tokens=self.n_feature_tokens,
+            h_feature=self.h_feature,
+            h_label=self.h_label,
+            dropout=self.dropout
+        )
+        self.optimizer = torch.optim.AdamW(self.level2model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        self.criterion = nn.BCEWithLogitsLoss()
+    
+    
+    def fit(
+        self,
+        X_train,
+        y_train,
+        save_model=True,
+    ):
+        X_train, y_train, probas_train = gen_oof_with_features(X_train, y_train)
+        train_joint(
+            model=self.level2model,
+            features=X_train,
+            probas=probas_train,
+            y=y_train,
+            optimizer=self.optimizer,
+            criterion=self.criterion,
+            save_model=save_model,
+            epochs=self.epochs,
+            batch_size=self.batch_size,
+            early_stopping_patience=self.early_stopping_patience,
+            early_stopping_delta=self.early_stopping_delta,
+            validation_split=self.validation_split,
+        )
+        self.X_train, self.y_train = X_train, y_train
+    
+    
+    def predict_proba(
+        self,
+        X_test,
+    ):
+        return predict_joint(self.level2model, self.X_train, self.y_train, X_test)
+    
+    
+    def load(
+        self,
+        path,
+    ):
+        load_model(model=self.level2model, optimizer=self.optimizer, path=path)
+
 def main():
-    # X, Y = make_multilabel_classification(n_samples=200, n_features=20, n_classes=6,
-    #                                       n_labels=2, random_state=0)
-    # X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.15, random_state=42)
-    X_train, X_test, y_train, y_test = get_dataset(test_split=0.15)
+    X_train, X_test, y_train, y_test = get_dataset(use_synthetic_data=True)
     n_features, n_labels = X_train.shape[1], y_train.shape[1]
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"main: n_features={n_features}, n_labels={n_labels}, device={device}")
-    model = JointFeatureLabelAttn(
+    model = MultiLabelTabPFN_FeatureLabel(
         n_features=n_features,
         n_labels=n_labels,
-    ).to(device)
-    print(f"main: model params count = {sum(p.numel() for p in model.parameters())}")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=1e-3)
-    criterion = nn.BCEWithLogitsLoss()
-    
-    X_train, y_train, probas_train = gen_oof_with_features(X_train, y_train)
-    print(f"main: after gen_oof_with_features X_train.shape={X_train.shape}, probas_train.shape={probas_train.shape}, y_train.shape={y_train.shape}")
-    print("training start...")
-    train_joint(
-        model=model,
-        features=X_train,
-        probas=probas_train,
-        y=y_train,
-        optimizer=optimizer,
-        criterion=criterion,
-        save_model=True,
-        epochs=10,
-        batch_size=128,
-        enable_early_stopping=True,
+        epochs=20,
     )
-    print("training over")
-    
-    y_test_probas = predict_joint(model, X_train, y_train, X_test)
+    model.fit(X_train, y_train, save_model=False)
+    y_test_probas = model.predict_proba(X_test)
     evaluate_multilabel(y_test, y_test_probas, obj_info='TabPFN+JointAttention')
     
 if __name__ == '__main__':

@@ -4,6 +4,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split, KFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import f1_score, hamming_loss, roc_auc_score
+from sklearn.datasets import make_multilabel_classification
 from tabpfn import TabPFNClassifier
 
 import torch
@@ -90,6 +91,7 @@ def gen_oof_data(X, y):
 def train(model, X_train, y_train, optimizer, criterion, save_model=False, epochs=10, batch_size=128, 
           early_stopping_patience=5, early_stopping_delta=1e-4, validation_split=0.2):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
     
     # 分割训练集和验证集
     from sklearn.model_selection import train_test_split
@@ -195,7 +197,7 @@ def train(model, X_train, y_train, optimizer, criterion, save_model=False, epoch
                 'optimizer_state_dict': optimizer.state_dict(),
             }, save_path)
             print(f"Model saved to {save_path}")
-    
+
 def load_model(model, optimizer=None, path=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -317,75 +319,125 @@ def evaluate_multilabel(y_true, y_prob, print_results=True, obj_info=None, thres
     
     return results
 
-def get_dataset(n_total_samples=3000, test_split=0.2):
-    local_csv = os.path.join("data", "41471.csv")
-    if os.path.exists(local_csv):
-        X = pd.read_csv(local_csv)
-        print(f"Loaded dataset from local file: {local_csv}")
+def get_dataset(n_total_samples=3000, test_split=0.2, use_synthetic_data=False, synthetic_size=500):
+    if use_synthetic_data:
+        X, y = make_multilabel_classification(n_samples=synthetic_size, n_features=20, n_classes=6, n_labels=2, random_state=0)
     else:
-        dataset = openml.datasets.get_dataset(41471)
-        X, _, _, _ = dataset.get_data(dataset_format='dataframe')
-        try:
-            X.to_csv(local_csv, index=False)
-            print(f"Fetched dataset from OpenML and saved to {local_csv}")
-        except Exception:
-            print("Fetched dataset from OpenML (failed to save locally)")
-    X = X.sample(frac=1, random_state=42).reset_index(drop=True).head(n_total_samples)
+        local_csv = os.path.join("data", "41471.csv")
+        if os.path.exists(local_csv):
+            X = pd.read_csv(local_csv)
+            print(f"Loaded dataset from local file: {local_csv}")
+        else:
+            dataset = openml.datasets.get_dataset(41471)
+            X, _, _, _ = dataset.get_data(dataset_format='dataframe')
+            try:
+                X.to_csv(local_csv, index=False)
+                print(f"Fetched dataset from OpenML and saved to {local_csv}")
+            except Exception:
+                print("Fetched dataset from OpenML (failed to save locally)")
+        X = X.sample(frac=1, random_state=42).reset_index(drop=True).head(n_total_samples)
 
-    cols = X.columns[-6:]
-    y = X[cols].map(lambda v: 1 if v else 0)
-    X = X.drop(columns=cols)
+        cols = X.columns[-6:]
+        y = X[cols].map(lambda v: 1 if v else 0)
+        X = X.drop(columns=cols)
+        y = y.values
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
     if test_split > 0:
         X_train, X_test, y_train, y_test = train_test_split(
-            X_scaled, y.values, test_size=test_split, random_state=42
+            X_scaled, y, test_size=test_split, random_state=42
         )
     else:
-        X_train, X_test, y_train, y_test = X_scaled, None, y.values, None
+        X_train, X_test, y_train, y_test = X_scaled, None, y, None
+    
     return X_train, X_test, y_train, y_test
 
-def main():
-    config = {
-        'd_model': 32,
-        'hidden': 8,
-        'n_heads': 4,
-        'epochs': 30,
-        'batch_size': 128
-    }
+class MultiLabelTabPFN_LabelOnly:
+    def __init__(
+        self,
+        n_labels,
+        d_model=32,
+        hidden=8,
+        n_heads=4,
+        epochs=10,
+        batch_size=128,
+        early_stopping_patience=5,
+        early_stopping_delta=1e-4,
+        validation_split=0.2,
+        learning_rate=3e-3,
+        weight_decay=1e-3,
+    ):
+        self.n_labels = n_labels
+        self.d_model = d_model
+        self.hidden = hidden
+        self.n_heads = n_heads
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_delta = early_stopping_delta
+        self.validation_split = validation_split
+        self.lr = learning_rate
+        self.weight_decay = weight_decay
+        
+        self.level2model = MLPWithAttention(
+            n_labels=self.n_labels,
+            d_model=self.d_model,
+            hidden=self.hidden,
+            n_heads=self.n_heads
+        )
+        self.optimizer = torch.optim.AdamW(self.level2model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        self.criterion = nn.BCEWithLogitsLoss()
+        
+    
+    def fit(
+        self,
+        X_train,
+        y_train,
+        save_model=True,
+    ):
+        tabpfn_probs, target = gen_oof_data(X_train, y_train)
+        train(
+            model=self.level2model,
+            X_train=tabpfn_probs,
+            y_train=target,
+            optimizer=self.optimizer,
+            criterion=self.criterion,
+            save_model=save_model,
+            epochs=self.epochs,
+            batch_size=self.batch_size,
+        )
+        self.X_train, self.y_train = X_train, y_train
+        
+        
+    def predict_proba(
+        self,
+        X_test,
+    ):
+        return predict(model=self.level2model, X_train=self.X_train, y_train=self.y_train, X_test=X_test)
+    
+    
+    def load(
+        self,
+        path,
+    ):
+        load_model(model=self.level2model, optimizer=self.optimizer, path=path)
 
-    X_train, X_test, y_train, y_test = get_dataset()
+def main():
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1"
+    X_train, X_test, y_train, y_test = get_dataset(use_synthetic_data=False)
     n_labels = y_train.shape[1]
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = MLPWithAttention(
+    model = MultiLabelTabPFN_LabelOnly(
         n_labels=n_labels,
-        d_model=config['d_model'],
-        hidden=config['hidden'],
-        n_heads=config['n_heads']
-    ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3, weight_decay=1e-3)
-    criterion = nn.BCEWithLogitsLoss()
-
-    tabpfn_probs, target = gen_oof_data(X_train, y_train)
-    train(
-        model=model,
-        X_train=tabpfn_probs,
-        y_train=target,
-        optimizer=optimizer,
-        criterion=criterion,
-        save_model=False,
-        epochs=config['epochs'],
-        batch_size=config['batch_size']
+        epochs=30,
     )
-    
-    y_test_prob = predict(model, X_train, y_train, X_test)
+    model.fit(X_train, y_train, save_model=False)
+    y_test_prob = model.predict_proba(X_test)
     
     # 评估模型性能
     evaluate_multilabel(y_test, y_test_prob)
-    print(config)
     
     
 if __name__ == '__main__':

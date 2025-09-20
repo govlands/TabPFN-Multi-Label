@@ -30,29 +30,13 @@ class TabDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-def prepare_data(config: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Generate a synthetic multilabel dataset and split."""
-    print("--- 1. Data Preparation ---")
-    n_samples = config["n_samples"]
-    X, y = make_multilabel_classification(
-        n_samples=n_samples, n_features=config["n_features"], n_classes=config["n_labels"],
-        n_labels=2, random_state=config["random_seed"]
-    )
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=config["test_set_size"], random_state=config["random_seed"]
-    )
-    print(f"Loaded and split data: {X_train.shape[0]} train, {X_test.shape[0]} test samples.")
-    print("---------------------------\n")
-    return X_train, X_test, y_train, y_test
-
-
-def build_tabpfns(n_labels: int, config: dict) -> list[TabPFNClassifier]:
+def build_tabpfns(n_labels, device, pfn_n_estimators, random_seed=42) -> list[TabPFNClassifier]:
     """Create m TabPFNClassifier instances (binary per-label)."""
     pfn_cfg = dict(
         ignore_pretraining_limits=True,
-        device=config["device"],
-        n_estimators=config["pfn_n_estimators"],
-        random_state=config["random_seed"],
+        device=device,
+        n_estimators=pfn_n_estimators,
+        random_state=random_seed,
         inference_precision=torch.float32,
         fit_mode="batched",
         differentiable_input=True,
@@ -62,34 +46,7 @@ def build_tabpfns(n_labels: int, config: dict) -> list[TabPFNClassifier]:
         clf = TabPFNClassifier(**pfn_cfg)
         clf._initialize_model_variables()
         tabpfns.append(clf)
-    return tabpfns, pfn_cfg
-
-
-def evaluate_model(
-    classifier: TabPFNClassifier,
-    eval_config: dict,
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_test: np.ndarray,
-    y_test: np.ndarray,
-) -> tuple[float, float]:
-    """Evaluates the model's performance on the test set."""
-    eval_classifier = clone_model_for_evaluation(
-        classifier, eval_config, TabPFNClassifier
-    )
-    eval_classifier.fit(X_train, y_train)
-
-    try:
-        probabilities = eval_classifier.predict_proba(X_test)
-        roc_auc = roc_auc_score(
-            y_test, probabilities, multi_class="ovr", average="weighted"
-        )
-        log_loss_score = log_loss(y_test, probabilities)
-    except Exception as e:
-        print(f"An error occurred during evaluation: {e}")
-        roc_auc, log_loss_score = np.nan, np.nan
-
-    return roc_auc, log_loss_score
+    return tabpfns
 
 
 def make_shared_split_fn(train_idx: np.ndarray, test_idx: np.ndarray, prefer_torch: bool = False):
@@ -139,7 +96,6 @@ def save_model_e2e(tabpfns, joint_model, optimizer, config, n_features, filepath
         tabpfns: List of TabPFNClassifier instances
         joint_model: JointFeatureLabelAttn model
         optimizer: AdamW optimizer
-        config: Training configuration dict
         n_features: Number of input features
         filepath: Path to save the model (without extension)
     """
@@ -194,21 +150,11 @@ def save_model_e2e(tabpfns, joint_model, optimizer, config, n_features, filepath
 
 
 def load_model_e2e(filepath, device='cuda' if torch.cuda.is_available() else 'cpu'):
-    """
-    加载端到端联合训练的完整模型状态
-    
-    Args:
-        filepath: Path to the saved model
-        device: Device to load the model to
-    
-    Returns:
-        tuple: (tabpfns, joint_model, optimizer, config)
-    """
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"Model file not found: {filepath}")
     
     # 加载保存的状态
-    save_state = torch.load(filepath, map_location=device)
+    save_state = torch.load(filepath, map_location=device, weights_only=False)
     
     if save_state.get('model_type') != 'e2e_joint_training':
         print("⚠️  Warning: This doesn't appear to be an e2e joint training model")
@@ -290,7 +236,8 @@ def predict_e2e(tabpfns, joint_model, X_train, y_train, X_test, device='cuda' if
         X_test = np.array(X_test)
     
     n_test = X_test.shape[0]
-    n_labels = len(tabpfns)
+    n_labels = y_train.shape[1]
+    joint_model = joint_model.to(device)
     
     joint_model.eval()
     z_logits_list = []
@@ -318,24 +265,7 @@ def predict_e2e(tabpfns, joint_model, X_train, y_train, X_test, device='cuda' if
 
 
 def predict_e2e_batch(tabpfns, joint_model, X_train, y_train, X_test, batch_size=1024, pred_time=4):
-    """
-    Repeatedly sample small subsets from the training data, run full end-to-end
-    prediction (TabPFNs -> joint model) and average the results.
 
-    This helps stabilize stochastic PFN outputs by Monte-Carlo ensembling over
-    different context subsets drawn from the training set.
-
-    Args:
-        tabpfns: list of TabPFNClassifier
-        joint_model: JointFeatureLabelAttn
-        X_train, y_train: full training data (np.ndarray or convertible)
-        X_test: test features to predict (np.ndarray)
-        batch_size: number of context samples to draw per repetition
-        pred_time: how many independent draws / predictions to average
-
-    Returns:
-        numpy.ndarray of shape (n_test_samples, n_labels) with averaged probs
-    """
     # Coerce to numpy for sampling convenience
     if not isinstance(X_train, np.ndarray):
         X_train = np.array(X_train)
@@ -370,65 +300,76 @@ def predict_e2e_batch(tabpfns, joint_model, X_train, y_train, X_test, batch_size
     return preds_mean
 
 
-def main() -> None:
-    """End-to-end joint training: m TabPFNs + JointFeatureLabelAttn with combined loss."""
-    # --- Config ---
-    config = {
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "random_seed": 42,
-        "n_samples": 200,
-        "test_set_size": 0.2,
-        "batch_size": 1024,
-        # "holdout_frac": 0.3,  # within-batch split for TabPFN context/test
-        "n_splits": 4,
-        "epochs": 5,
-        # model sizes
-        "n_features": 20,
-        "n_labels": 6,
-        # TabPFN and Joint lrs
-        "pfn_lr": 1e-5,
-        "joint_lr": 3e-3,
-        "pfn_n_estimators": 4,
-        # loss weights
-        "lambda1": 0.5,
-        "lambda2": 0,
-    }
-
-    torch.manual_seed(config["random_seed"])
-    # X_train, X_test, y_train, y_test = prepare_data(config)
-    X_train, X_test, y_train, y_test = get_dataset(test_split=0.15)
-    n_features, n_labels = X_train.shape[1], y_train.shape[1]
-    device = torch.device(config["device"]) if isinstance(config["device"], str) else config["device"]
-
-    # Build models
-    tabpfns, pfn_cfg = build_tabpfns(n_labels, config)
-    config['tabpfn_config'] = pfn_cfg
-    joint = JointFeatureLabelAttn(n_features=n_features, n_labels=n_labels).to(device)
-
-    # Build optimizer with param groups
-    pfn_params = []
-    for clf in tabpfns:
-        pfn_params += list(clf.model_.parameters())
-    optim = AdamW([
-        {"params": joint.parameters(), "lr": config["joint_lr"]},
-        {"params": pfn_params, "lr": config["pfn_lr"]},
-    ])
-    bce_logits = torch.nn.BCEWithLogitsLoss()
-
-    # DataLoader over raw training data
+def train_e2e(
+    n_labels,
+    X_train,
+    y_train,
+    joint_model,
+    tabpfns,
+    bce_loss,
+    optim,
+    batch_size=512,
+    epochs=10,
+    n_splits=4,
+    random_seed=42,
+    device='cuda',
+    lambda1=0.5,
+    lambda2=0,
+    validation_split=0.15,
+    early_stopping_patience=5,
+    early_stopping_delta=1e-4
+) -> None:
+    """End-to-end joint training: m TabPFNs + JointFeatureLabelAttn with combined loss with early stopping."""
+    from sklearn.model_selection import train_test_split
+    
+    # Split training data into train and validation sets
+    if validation_split > 0:
+        X_train_split, X_val_split, y_train_split, y_val_split = train_test_split(
+            X_train, y_train, 
+            test_size=validation_split, 
+            random_state=random_seed,
+            stratify=None  # Multi-label stratification is complex, so we skip it for now
+        )
+        print(f"--- Data Split: Train={X_train_split.shape[0]}, Val={X_val_split.shape[0]} ---")
+    else:
+        X_train_split, y_train_split = X_train, y_train
+        X_val_split, y_val_split = None, None
+        print("--- No validation split, using full training data ---")
+    
+    # DataLoader over training data
     train_loader = DataLoader(
-        TabDataset(X_train, y_train),
-        batch_size=config["batch_size"], shuffle=True
+        TabDataset(X_train_split, y_train_split),
+        batch_size=batch_size, shuffle=True
     )
+    
+    # Validation DataLoader if validation split exists
+    if X_val_split is not None:
+        val_loader = DataLoader(
+            TabDataset(X_val_split, y_val_split),
+            batch_size=batch_size, shuffle=False
+        )
+    else:
+        val_loader = None
+    
+    joint = joint_model.to(device)
+    bce_logits = bce_loss
+    
+    # Early stopping variables
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_epoch = 0
+    best_model_state = None
     
     DEBUG = False
 
-    print("--- 3. Starting End-to-End Joint Training ---")
-    for epoch in range(1, config["epochs"] + 1):
+    print("--- Starting End-to-End Joint Training ---")
+    for epoch in range(1, epochs + 1):
         joint.train()
-        running = 0.0
-        steps = 0
-        for X_mb_t, Y_mb_t in tqdm(train_loader, desc=f"Epoch {epoch}"):
+        running_train_loss = 0.0
+        train_steps = 0
+        
+        # Training phase
+        for X_mb_t, Y_mb_t in tqdm(train_loader, desc=f"Epoch {epoch} [Train]"):
             X_mb = X_mb_t.numpy()   # mb: mini-batch
             Y_mb = Y_mb_t.numpy().astype(np.int64)
             
@@ -437,9 +378,8 @@ def main() -> None:
             # shared split indices within batch
             idx = np.arange(n_b)
             
-            # kf = KFold(n_splits=config['n_splits'], shuffle=True, random_state=config['random_seed'])
             kf_iter = MultilabelStratifiedKFold(
-                n_splits=config['n_splits'], shuffle=True, random_state=config['random_seed']
+                n_splits=n_splits, shuffle=True, random_state=random_seed
             ).split(idx, Y_mb)
             
             batch_loss_sum = None
@@ -525,7 +465,7 @@ def main() -> None:
                 loss2 = bce_logits(y2_logits, Y_te)
                 loss_z = bce_logits(Z_te, Y_te)
                 # KL between sigmoid(Z) and stopgrad(sigmoid(y2_logits))
-                if config["lambda2"] > 0:
+                if lambda2 > 0:
                     eps = 1e-6
                     p = torch.sigmoid(Z_te).clamp(eps, 1 - eps)
                     q = torch.sigmoid(y2_logits).detach().clamp(eps, 1 - eps)
@@ -533,7 +473,7 @@ def main() -> None:
                     loss_kl = kl.mean()
                 else:
                     loss_kl = torch.tensor(0.0, device=device)
-                loss = loss2 + config["lambda1"] * loss_z + config["lambda2"] * loss_kl
+                loss = loss2 + lambda1 * loss_z + lambda2 * loss_kl
 
                 batch_loss_sum = loss if batch_loss_sum is None else (batch_loss_sum + loss)
                 n_used_folds += 1
@@ -543,27 +483,341 @@ def main() -> None:
                 optim.zero_grad()
                 loss_mean.backward()
                 optim.step()
-                running += float(loss.item())
-                steps += 1
+                running_train_loss += float(loss_mean.item())
+                train_steps += 1
 
-        avg_loss = running / max(1, steps)
-        print(f"Epoch {epoch}: train joint loss = {avg_loss:.4f}")
+        # Calculate average training loss
+        avg_train_loss = running_train_loss / max(1, train_steps)
+        
+        # Validation phase
+        val_loss = None
+        if val_loader is not None:
+            joint.eval()
+            running_val_loss = 0.0
+            val_steps = 0
+            
+            with torch.no_grad():
+                for X_mb_t, Y_mb_t in tqdm(val_loader, desc=f"Epoch {epoch} [Val]", leave=False):
+                    X_mb = X_mb_t.numpy()
+                    Y_mb = Y_mb_t.numpy().astype(np.int64)
+                    
+                    n_b = X_mb.shape[0]
+                    idx = np.arange(n_b)
+                    
+                    kf_iter = MultilabelStratifiedKFold(
+                        n_splits=n_splits, shuffle=True, random_state=random_seed
+                    ).split(idx, Y_mb)
+                    
+                    batch_loss_sum = None
+                    n_used_folds = 0
+                    
+                    for train_idx, test_idx in kf_iter:
+                        skip_fold = False
+                        for i in range(n_labels):
+                            if len(np.unique(Y_mb[test_idx, i])) < 2 or len(np.unique(Y_mb[train_idx, i])) < 2:
+                                skip_fold = True
+                                break
+                        if skip_fold: continue
+
+                        split_fn = make_shared_split_fn(train_idx, test_idx, prefer_torch=True)
+                        n_te = len(test_idx)
+                        pos_list = []
+
+                        # Validation forward pass (similar to training but without gradients)
+                        for ell in range(n_labels):
+                            y_ell_t = Y_mb_t[:, ell]
+                            ds = tabpfns[ell].get_preprocessed_datasets(
+                                X_mb_t, y_ell_t, split_fn, max_data_size=None
+                            )
+                            dl = DataLoader(ds, batch_size=1, collate_fn=meta_dataset_collator)
+                            for (
+                                X_tr_list,
+                                X_te_list,
+                                y_tr_list,
+                                y_te_raw,
+                                cat_ixs,
+                                confs,
+                            ) in dl:
+                                tabpfns[ell].fit_from_preprocessed(X_tr_list, y_tr_list, cat_ixs, confs, no_refit=True)
+                                preds = tabpfns[ell].forward(X_te_list, return_logits=True)
+                                
+                                if isinstance(preds, (list, tuple)):
+                                    preds = preds[0]
+                                if preds.dim() == 3 and preds.shape[0] == 1:
+                                    preds = preds.squeeze(0)
+                                    
+                                if preds.shape[0] == 2 and preds.shape[1] == n_te:
+                                    pos_logits = preds[1, :]
+                                elif preds.shape[1] == 2 and preds.shape[0] == n_te:
+                                    pos_logits = preds[:, 1]
+                                else:
+                                    raise RuntimeError(f"Unexpected PFN logits shape for label {ell}: {tuple(preds.shape)}")
+
+                                pos = pos_logits.to(device=device, dtype=torch.float32).contiguous().view(-1)
+                                if pos.shape[0] != n_te:
+                                    raise RuntimeError(f"Label {ell}: expected {n_te} logits, got {pos.shape[0]}")
+                                pos_list.append(pos)
+                                break
+
+                        Z_te = torch.stack(pos_list, dim=1)
+                        X_te_raw = torch.from_numpy(X_mb[test_idx]).to(device=device, dtype=torch.float32)
+                        Y_te = torch.from_numpy(Y_mb[test_idx]).to(device=device, dtype=torch.float32)
+                        y2_logits = joint(X_te_raw, Z_te)
+
+                        # Calculate validation loss (same as training loss)
+                        loss2 = bce_logits(y2_logits, Y_te)
+                        loss_z = bce_logits(Z_te, Y_te)
+                        if lambda2 > 0:
+                            eps = 1e-6
+                            p = torch.sigmoid(Z_te).clamp(eps, 1 - eps)
+                            q = torch.sigmoid(y2_logits).detach().clamp(eps, 1 - eps)
+                            kl = p * (p / q).log() + (1 - p) * ((1 - p) / (1 - q)).log()
+                            loss_kl = kl.mean()
+                        else:
+                            loss_kl = torch.tensor(0.0, device=device)
+                        loss = loss2 + lambda1 * loss_z + lambda2 * loss_kl
+
+                        batch_loss_sum = loss if batch_loss_sum is None else (batch_loss_sum + loss)
+                        n_used_folds += 1
+
+                    if n_used_folds > 0:
+                        loss_mean = batch_loss_sum / n_used_folds
+                        running_val_loss += float(loss_mean.item())
+                        val_steps += 1
+
+            val_loss = running_val_loss / max(1, val_steps)
+
+        # Print epoch results
+        if val_loss is not None:
+            print(f"Epoch {epoch}: train_loss = {avg_train_loss:.4f}, val_loss = {val_loss:.4f}")
+            
+            # Early stopping check
+            if val_loss < best_val_loss - early_stopping_delta:
+                best_val_loss = val_loss
+                patience_counter = 0
+                best_epoch = epoch
+                # Save best model state
+                best_model_state = {
+                    'joint_state_dict': joint.state_dict().copy(),
+                    'tabpfn_states': [clf.model_.state_dict().copy() for clf in tabpfns],
+                    'optimizer_state_dict': optim.state_dict().copy(),
+                    'epoch': epoch,
+                    'train_loss': avg_train_loss,
+                    'val_loss': val_loss
+                }
+                print(f"    ✅ New best validation loss: {val_loss:.4f}")
+            else:
+                patience_counter += 1
+                print(f"    ⏳ No improvement for {patience_counter} epochs")
+                
+                if patience_counter >= early_stopping_patience:
+                    print(f"🛑 Early stopping triggered at epoch {epoch}")
+                    print(f"📊 Best validation loss: {best_val_loss:.4f} at epoch {best_epoch}")
+                    break
+        else:
+            print(f"Epoch {epoch}: train_loss = {avg_train_loss:.4f}")
+    
+    # Restore best model if early stopping occurred and we have a saved state
+    if best_model_state is not None:
+        print(f"🔄 Restoring best model from epoch {best_epoch}")
+        joint.load_state_dict(best_model_state['joint_state_dict'])
+        for i, clf in enumerate(tabpfns):
+            clf.model_.load_state_dict(best_model_state['tabpfn_states'][i])
+        optim.load_state_dict(best_model_state['optimizer_state_dict'])
+        print(f"✅ Best model restored (val_loss: {best_val_loss:.4f})")
 
     print("--- ✅ End-to-End Joint Training Finished ---")
-    
-    # 保存完整的端到端模型
-    model_path = os.path.join("models", "e2e_joint_model")
-    os.makedirs("models", exist_ok=True)
-    save_model_e2e(tabpfns, joint, optim, config, n_features, model_path)
 
-    pred_result_all = predict_e2e(tabpfns, joint, X_train, y_train, X_test)
-    pred_result_batch = predict_e2e_batch(tabpfns, joint, X_train, y_train, X_test, batch_size=config["batch_size"])
-    print("pred_result_all performence:")
+
+class MultiLabelTabPFN_e2eFeatureLabel:
+    def __init__(
+        self,
+        n_features,
+        n_labels,
+        pfn_n_estimators=4,
+        random_seed=42,
+        batch_size=512,
+        epochs=10,
+        n_splits=4,
+        lambda1=0.5,
+        lambda2=0,
+        tabpfn_lr=1e-5,
+        joint_lr=3e-3,
+        validation_split=0.15,
+        early_stopping_patience=5,
+        early_stopping_delta=1e-4,
+    ):
+        self.n_features = n_features
+        self.n_labels = n_labels
+        self.pfn_n_estimators = pfn_n_estimators
+        self.seed = random_seed
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.n_splits = n_splits
+        self.lambda1 = lambda1
+        self.lambda2 = lambda2
+        self.tabpfn_lr = tabpfn_lr
+        self.joint_lr = joint_lr
+        self.validation_split = validation_split
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_delta = early_stopping_delta
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        self.tabpfns = build_tabpfns(
+            n_labels=self.n_labels,
+            device=self.device,
+            pfn_n_estimators=self.pfn_n_estimators,
+            random_seed=self.seed
+        )
+        self.joint = JointFeatureLabelAttn(
+            n_features=self.n_features,
+            n_labels=self.n_labels
+        ).to(self.device)
+        
+        pfn_params = []
+        for clf in self.tabpfns:
+            pfn_params += list(clf.model_.parameters())
+        self.optim = AdamW([
+            {"params": self.joint.parameters(), "lr": self.joint_lr},
+            {"params": pfn_params, "lr": self.tabpfn_lr},
+        ])
+        self.bce_loss = torch.nn.BCEWithLogitsLoss()
+    
+    
+    def fit(
+        self,
+        X_train,
+        y_train,
+    ):
+        train_e2e(
+            n_labels=self.n_labels,
+            X_train=X_train,
+            y_train=y_train,
+            joint_model=self.joint,
+            tabpfns=self.tabpfns,
+            bce_loss=self.bce_loss,
+            optim=self.optim,
+            batch_size=self.batch_size,
+            epochs=self.epochs,
+            n_splits=int(self.n_splits),
+            random_seed=self.seed,
+            lambda1=self.lambda1,
+            lambda2=self.lambda2,
+            device=str(self.device),
+            validation_split=self.validation_split,
+            early_stopping_patience=self.early_stopping_patience,
+            early_stopping_delta=self.early_stopping_delta,
+        )
+        self.X_train = X_train
+        self.y_train = y_train
+    
+    
+    def predict_proba(
+        self,
+        X_test,
+        mode='batch'
+    ):
+        if mode == 'batch':
+            # n_splits = int(self.n_splits)
+            # batch_size = int(self.batch_size * (1 - 1 / n_splits))
+            batch_size = self.batch_size
+            return predict_e2e_batch(
+                tabpfns=self.tabpfns,
+                joint_model=self.joint,
+                X_train=self.X_train,
+                y_train=self.y_train,
+                X_test=X_test,
+                batch_size=batch_size,
+                pred_time=5,
+            )
+        elif mode == 'all':
+            return predict_e2e(
+                tabpfns=self.tabpfns,
+                joint_model=self.joint,
+                X_train=self.X_train,
+                y_train=self.y_train,
+                X_test=X_test,
+            )
+        else:
+            raise ValueError(f"Unknown mode: {mode!r}. Valid modes are 'batch' or 'all'.")
+    
+    
+    def save(self):
+        pfn_cfg = dict(
+            ignore_pretraining_limits=True,
+            device=self.device,
+            n_estimators=self.pfn_n_estimators,
+            random_state=self.seed,
+            inference_precision=torch.float32,
+            fit_mode="batched",
+            differentiable_input=True,
+        )
+
+        config = {
+            "tabpfn_config": pfn_cfg,
+            "joint_lr": self.joint_lr,
+            "pfn_lr": self.tabpfn_lr,
+            "n_features": self.n_features,
+            "n_labels": self.n_labels,
+            "batch_size": self.batch_size,
+            "epochs": self.epochs,
+            "n_splits": self.n_splits,
+            "lambda1": self.lambda1,
+            "lambda2": self.lambda2,
+            "random_seed": self.seed,
+        }
+
+        os.makedirs("models", exist_ok=True)
+        filepath = os.path.join("models", "e2e_joint_model")
+        return save_model_e2e(self.tabpfns, self.joint, self.optim, config, self.n_features, filepath)
+    
+    
+    def load(self, path):
+        tabpfns, joint_model, optimizer, config = load_model_e2e(filepath=path)
+        self.tabpfns = tabpfns
+        self.joint = joint_model
+        self.optim = optimizer
+
+
+def main():
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+    X_train, X_test, y_train, y_test = get_dataset(use_synthetic_data=True, synthetic_size=1000)
+    n_features, n_labels = X_train.shape[1], y_train.shape[1]
+    
+    # Create model with early stopping enabled
+    model = MultiLabelTabPFN_e2eFeatureLabel(
+        n_features=n_features,
+        n_labels=n_labels,
+        epochs=20,                      # Increased epochs since we have early stopping
+        batch_size=400,
+        n_splits=4,
+        pfn_n_estimators=4,
+        validation_split=0.15,          # Use 15% of training data for validation
+        early_stopping_patience=5,      # Stop if no improvement for 5 epochs
+        early_stopping_delta=1e-4,      # Minimum improvement threshold
+    )
+    
+    print("🚀 Starting training with early stopping...")
+    model.fit(X_train, y_train)
+    
+    print("\n📊 Making predictions...")
+    pred_result_all = model.predict_proba(X_test, mode='all')
+    pred_result_batch = model.predict_proba(X_test, mode='batch')
+
+    print("\n📈 Evaluation Results:")
+    print("=" * 50)
+    print("pred_result_all performance:")
     evaluate_multilabel(y_test, pred_result_all)
-    print("pred_result_batch perfrmence:")
+    print("\npred_result_batch performance:")
     evaluate_multilabel(y_test, pred_result_batch)
     
-    return tabpfns, joint, optim
+    # save_path = model.save()
+    # test_load = MultiLabelTabPFN_e2eFeatureLabel(
+    #     n_features=n_features,
+    #     n_labels=n_labels,
+    #     epochs=5,
+    # )
+    # test_load.load(save_path)
 
 
 if __name__ == "__main__":
